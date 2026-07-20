@@ -3032,23 +3032,46 @@ def add_board_matchpoint_top(df: pl.DataFrame) -> pl.DataFrame:
     if 'section_id' in df.columns:
         board_cols.insert(1, 'section_id')
 
-    # Tables represented in this df (club-scoped Lancelot fetch may be << simultaneous freq list).
-    field_mp_top = pl.col('Score_NS').count().over(board_cols).sub(1).cast(pl.UInt32)
-
-    if 'MP_Top' in df.columns:
-        df = df.with_columns(pl.min_horizontal(pl.col('MP_Top'), field_mp_top).alias('MP_Top'))
-    else:
-        df = df.with_columns(field_mp_top.alias('MP_Top'))
-
-    # When Pct_* came from the API (Lancelot notes), resync MP totals to the corrected MP_Top.
-    if 'Pct_NS' in df.columns and 'Pct_EW' in df.columns:
-        df = df.with_columns(
-            (pl.col('Pct_NS') * pl.col('MP_Top')).round(2).alias('MP_NS'),
-            (pl.col('Pct_EW') * pl.col('MP_Top')).round(2).alias('MP_EW'),
+    # Score_NS path: count tables in this frame (Lancelot club-scoped fetch may be
+    # << simultaneous freq list). Elo create uses a narrow column set without
+    # Score_NS and derives MP_Top from MP_NS+MP_EW instead.
+    # count() is UInt64; cast to Int64 before sub(1) to avoid unsigned underflow.
+    # Groups with all-null Score_NS get count==0 -> -1; clip to 0 (Polars still
+    # evaluates then-casts on false when-branches, so when/then is not safe here).
+    # Rows with MP_Top==0 are dropped by the filter below.
+    if 'Score_NS' in df.columns:
+        field_mp_top = (
+            pl.col('Score_NS')
+            .count()
+            .over(board_cols)
+            .cast(pl.Int64)
+            .sub(1)
+            .clip(lower_bound=0)
+            .cast(pl.UInt32)
         )
+
+        if 'MP_Top' in df.columns:
+            df = df.with_columns(pl.min_horizontal(pl.col('MP_Top'), field_mp_top).alias('MP_Top'))
+        else:
+            df = df.with_columns(field_mp_top.alias('MP_Top'))
+
+        # When Pct_* came from the API (Lancelot notes), resync MP totals to the corrected MP_Top.
+        if 'Pct_NS' in df.columns and 'Pct_EW' in df.columns:
+            df = df.with_columns(
+                (pl.col('Pct_NS') * pl.col('MP_Top')).round(2).alias('MP_NS'),
+                (pl.col('Pct_EW') * pl.col('MP_Top')).round(2).alias('MP_EW'),
+            )
+        elif 'MP_NS' in df.columns and 'MP_EW' in df.columns:
+            df = df.with_columns(
+                pl.col('MP_NS').add(pl.col('MP_EW')).cast(pl.Float64).round(0).cast(pl.UInt32).alias('MP_Top'),
+            )
     elif 'MP_NS' in df.columns and 'MP_EW' in df.columns:
         df = df.with_columns(
             pl.col('MP_NS').add(pl.col('MP_EW')).cast(pl.Float64).round(0).cast(pl.UInt32).alias('MP_Top'),
+        )
+    elif 'MP_Top' not in df.columns:
+        raise ValueError(
+            "add_board_matchpoint_top requires Score_NS, MP_NS+MP_EW, or existing MP_Top"
         )
 
     df = df.filter(pl.col('MP_Top').is_not_null() & pl.col('MP_Top').gt(0))
@@ -3613,6 +3636,53 @@ FIELD_STRENGTH_Z_FLOOR = -2.0   # k_min at this many sigmas below population mea
 FIELD_STRENGTH_K_MIN = 0.25     # floor on the K multiplier
 
 
+# -------------------------------
+# Event MP-limit (ACBL strata) K-scale
+# -------------------------------
+# Separate from ``_stratum_scale`` (field-Elo mix / stdev dampening). This
+# multiplies K by how important the *event entry limit* is: Open / unlimited
+# games are the skill signal we trust; restricted flights (0-299, NLM, …)
+# move ratings far less so they cannot dominate Open results.
+#
+# ``strata_bucket`` is written by acbl_elo_ratings_create.py from club
+# ``mpLimits`` / tournament ``mp_limit``. Missing column → scale 1.0
+# (non-ACBL callers unchanged).
+#
+# Combined effective K:
+#   K_eff = K_base * boost * section_scale * stratum_scale
+#           * field_strength_scale * event_mp_limit_scale
+EVENT_MP_LIMIT_K_SCALE = {
+    "open": 1.00,
+    "0-1500": 0.50,
+    "0-749": 0.35,
+    "0-499-nlm": 0.25,
+    "0-299": 0.15,
+    "other-restricted": 0.20,
+}
+EVENT_MP_LIMIT_K_SCALE_DEFAULT = 1.0  # unknown / missing bucket
+
+
+def _event_mp_limit_k_scale(bucket: object) -> float:
+    """K multiplier for an ACBL event ``strata_bucket`` (Open ≫ restricted)."""
+    if bucket is None:
+        return EVENT_MP_LIMIT_K_SCALE_DEFAULT
+    key = str(bucket).strip().lower()
+    if not key or key == "nan":
+        return EVENT_MP_LIMIT_K_SCALE_DEFAULT
+    return float(EVENT_MP_LIMIT_K_SCALE.get(key, EVENT_MP_LIMIT_K_SCALE_DEFAULT))
+
+
+def _event_mp_limit_scale_array(df_sorted: pl.DataFrame, n_rows: int) -> np.ndarray:
+    """Per-row event-MP-limit K scales; ones if ``strata_bucket`` is absent."""
+    if "strata_bucket" not in df_sorted.columns or n_rows == 0:
+        return np.ones(n_rows, dtype=np.float32)
+    buckets = df_sorted.get_column("strata_bucket").to_list()
+    return np.asarray(
+        [_event_mp_limit_k_scale(b) for b in buckets],
+        dtype=np.float32,
+    )
+
+
 def _stratum_scale(ratio: float) -> float:
     """K-dampening multiplier in [k_min, 1.0] given a stdev ratio.
 
@@ -3644,14 +3714,14 @@ def _field_strength_scale(z: float) -> float:
     capping the maximum Elo gain a weak-field player can accumulate per
     board even if they routinely score above their own (weak) field.
 
-    Combined with :func:`_stratum_scale`, the effective K per board is::
+    Combined with :func:`_stratum_scale` and :func:`_event_mp_limit_k_scale`,
+    the effective K per board is::
 
-        K_eff = K_base * boost * section_scale * stratum_scale * field_strength_scale
+        K_eff = K_base * boost * section_scale * stratum_scale
+                * field_strength_scale * event_mp_limit_scale
 
-    so a board that is both stratum-mixed AND in a weak field gets the
-    product of both dampening factors. Each factor has its own floor of
-    0.25 by default; the joint floor is therefore 0.0625 ≈ 1/16 the
-    nominal K.
+    so a board that is stratum-mixed AND in a weak field AND in a restricted
+    MP-limit event gets the product of those dampening factors.
     """
     z_full = FIELD_STRENGTH_Z_FULL
     z_floor = FIELD_STRENGTH_Z_FLOOR
@@ -3746,6 +3816,12 @@ def compute_pair_matchpoint_elo_ratings(
       score above their own (very different-strength) fields. With this
       term, weak-field gains are damped from full K at z=0 down to
       ``FIELD_STRENGTH_K_MIN`` at z=``FIELD_STRENGTH_Z_FLOOR``.
+    - **K-scale on event MP-limit (ACBL strata):** when column
+      ``strata_bucket`` is present (from ``acbl_elo_ratings_create.py``),
+      Open/unlimited events use full K while restricted flights
+      (0-299, NLM/0-500, …) use sharply reduced K via
+      :func:`_event_mp_limit_k_scale` / ``EVENT_MP_LIMIT_K_SCALE``. Open
+      results therefore dominate rating movement.
     - Preserves the previous safety net: provisional boost for new pairs,
       hard rating clamp, Section_Pairs scaling, leakage-safe Before values.
 
@@ -3929,13 +4005,16 @@ def compute_pair_matchpoint_elo_ratings(
         global_stdev_ns = _global_stdev_seed(df_sorted, "Elo_R_NS_Before")
     if global_stdev_ew is None:
         global_stdev_ew = _global_stdev_seed(df_sorted, "Elo_R_EW_Before")
+    event_mp_scale = _event_mp_limit_scale_array(df_sorted, n_rows)
     logger.info(
         "compute_pair_matchpoint_elo_ratings: K-dampening seeds "
         f"global_stdev_ns={global_stdev_ns:.2f} global_stdev_ew={global_stdev_ew:.2f}; "
         f"stratum anchors low={STRATUM_DAMPENING_LOW_RATIO} high={STRATUM_DAMPENING_HIGH_RATIO} "
         f"k_min={STRATUM_DAMPENING_K_MIN}; "
         f"field-strength anchors z_full={FIELD_STRENGTH_Z_FULL} z_floor={FIELD_STRENGTH_Z_FLOOR} "
-        f"k_min={FIELD_STRENGTH_K_MIN} pop_mean={initial_rating}"
+        f"k_min={FIELD_STRENGTH_K_MIN} pop_mean={initial_rating}; "
+        f"event_mp_limit_scale={'strata_bucket' if 'strata_bucket' in df_sorted.columns else 'absent→1.0'} "
+        f"map={EVENT_MP_LIMIT_K_SCALE}"
     )
 
     # Processing order: (Date, session_id, Board) so a session's boards are
@@ -4042,14 +4121,13 @@ def compute_pair_matchpoint_elo_ratings(
                 e_ew = 1.0 / (1.0 + 10.0 ** (-(r_ew_self - field_avg_ew) / elo_scale))
 
                 # K factor with provisional boost (per-pair counter), section
-                # scaling, stratum-mixed dampening, AND field-strength
-                # dampening (Zubatch fix: a weak-field player can't farm Elo
-                # at the same rate as a competitive-field player even when
-                # winning their own field).
+                # scaling, stratum-mixed dampening, field-strength dampening
+                # (Zubatch), AND event MP-limit scale (Open ≫ restricted).
                 boost_ns = 1.5 if boards_played_ns[idx_ns] < provisional_boost_until else 1.0
                 boost_ew = 1.5 if boards_played_ew[idx_ew] < provisional_boost_until else 1.0
-                k_ns = k_base * boost_ns * float(scale[i]) * stratum_scale_ns * field_strength_ns
-                k_ew = k_base * boost_ew * float(scale[i]) * stratum_scale_ew * field_strength_ew
+                emp = float(event_mp_scale[i])
+                k_ns = k_base * boost_ns * float(scale[i]) * stratum_scale_ns * field_strength_ns * emp
+                k_ew = k_base * boost_ew * float(scale[i]) * stratum_scale_ew * field_strength_ew * emp
 
                 # Outputs: Before == session-start snapshot, E == field-relative.
                 r_ns_before_arr[i] = r_ns_self
@@ -4302,11 +4380,14 @@ def compute_player_matchpoint_elo_ratings(
         global_stdev_ns = _global_stdev_seed(df_sorted, "Elo_R_N_Before")
     if global_stdev_ew is None:
         global_stdev_ew = _global_stdev_seed(df_sorted, "Elo_R_E_Before")
+    event_mp_scale = _event_mp_limit_scale_array(df_sorted, n_rows)
     logger.info(
         "compute_player_matchpoint_elo_ratings: K-dampening seeds "
         f"global_stdev_ns={global_stdev_ns:.2f} global_stdev_ew={global_stdev_ew:.2f}; "
         f"field-strength anchors z_full={FIELD_STRENGTH_Z_FULL} z_floor={FIELD_STRENGTH_Z_FLOOR} "
-        f"k_min={FIELD_STRENGTH_K_MIN} pop_mean={initial_rating}"
+        f"k_min={FIELD_STRENGTH_K_MIN} pop_mean={initial_rating}; "
+        f"event_mp_limit_scale={'strata_bucket' if 'strata_bucket' in df_sorted.columns else 'absent→1.0'} "
+        f"map={EVENT_MP_LIMIT_K_SCALE}"
     )
 
     # Processing order: (Date, session_id, Board) — same as pair function.
@@ -4409,13 +4490,13 @@ def compute_player_matchpoint_elo_ratings(
                 e_ns = 1.0 / (1.0 + 10.0 ** (-(ns_self - field_avg_ns) / elo_scale))
                 e_ew = 1.0 / (1.0 + 10.0 ** (-(ew_self - field_avg_ew) / elo_scale))
 
-                # K factor now includes BOTH stratum dampening AND
-                # field-strength dampening (Zubatch fix); see pair function
-                # for full rationale.
-                k_n = k_base * (1.5 if boards_played_ns[idx_n] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ns * field_strength_ns
-                k_s = k_base * (1.5 if boards_played_ns[idx_s] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ns * field_strength_ns
-                k_e = k_base * (1.5 if boards_played_ew[idx_e] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ew * field_strength_ew
-                k_w = k_base * (1.5 if boards_played_ew[idx_w] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ew * field_strength_ew
+                # K factor: stratum dampening + field-strength (Zubatch) +
+                # event MP-limit scale (Open ≫ restricted); see pair function.
+                emp = float(event_mp_scale[i])
+                k_n = k_base * (1.5 if boards_played_ns[idx_n] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ns * field_strength_ns * emp
+                k_s = k_base * (1.5 if boards_played_ns[idx_s] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ns * field_strength_ns * emp
+                k_e = k_base * (1.5 if boards_played_ew[idx_e] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ew * field_strength_ew * emp
+                k_w = k_base * (1.5 if boards_played_ew[idx_w] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ew * field_strength_ew * emp
 
                 R_N_Before[i] = snap_ns[idx_n]
                 R_S_Before[i] = snap_ns[idx_s]

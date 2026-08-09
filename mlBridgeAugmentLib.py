@@ -3038,7 +3038,9 @@ def add_board_matchpoint_top(df: pl.DataFrame) -> pl.DataFrame:
     # count() is UInt64; cast to Int64 before sub(1) to avoid unsigned underflow.
     # Groups with all-null Score_NS get count==0 -> -1; clip to 0 (Polars still
     # evaluates then-casts on false when-branches, so when/then is not safe here).
-    # Rows with MP_Top==0 are dropped by the filter below.
+    # Single-table / hand-record PBNs get MP_Top==0 (count-1). Keep those rows so
+    # DD/par analysis still works; only drop MP_Top==0 boards when the frame has
+    # at least one multi-table board (real matchpoint event with a bad board).
     if 'Score_NS' in df.columns:
         field_mp_top = (
             pl.col('Score_NS')
@@ -3074,7 +3076,9 @@ def add_board_matchpoint_top(df: pl.DataFrame) -> pl.DataFrame:
             "add_board_matchpoint_top requires Score_NS, MP_NS+MP_EW, or existing MP_Top"
         )
 
-    df = df.filter(pl.col('MP_Top').is_not_null() & pl.col('MP_Top').gt(0))
+    max_mp_top = df.select(pl.col('MP_Top').max()).item()
+    if max_mp_top is not None and max_mp_top > 0:
+        df = df.filter(pl.col('MP_Top').is_not_null() & pl.col('MP_Top').gt(0))
     return df
 
 def add_matchpoint_scores_from_raw(df: pl.DataFrame) -> pl.DataFrame:
@@ -3142,11 +3146,17 @@ def add_percentage_scores(df: pl.DataFrame) -> pl.DataFrame:
     Returns:
     - DataFrame with added percentage score columns
     """
+    # Hand-record / single-table frames have MP_Top==0; leave Pct_* null.
     df = df.with_columns([
-        (pl.col('MP_NS') / pl.col('MP_Top')).cast(pl.Float32).alias('Pct_NS'),
-        (pl.col('MP_EW') / pl.col('MP_Top')).cast(pl.Float32).alias('Pct_EW')
+        pl.when(pl.col('MP_Top') > 0)
+        .then((pl.col('MP_NS') / pl.col('MP_Top')).cast(pl.Float32))
+        .otherwise(None)
+        .alias('Pct_NS'),
+        pl.when(pl.col('MP_Top') > 0)
+        .then((pl.col('MP_EW') / pl.col('MP_Top')).cast(pl.Float32))
+        .otherwise(None)
+        .alias('Pct_EW'),
     ])
-    # df =  df.filter(~pl.col('Pct_NS').is_infinite() & ~pl.col('Pct_EW').is_infinite())
     return df
 
 def add_declarer_percentage(df: pl.DataFrame) -> pl.DataFrame:

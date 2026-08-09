@@ -543,4 +543,8 @@ def convert_endplay_df_to_mlBridge_df(df):
             #'MatchPoints_EW',
         }
     )
+    # Favorites SQL (e.g. Rankings_Without_Gifts) concatenates section_name; PBNs
+    # have no ACBL section, so provide an empty placeholder when absent.
+    if 'section_name' not in df.columns:
+        df = df.with_columns(pl.lit('').alias('section_name'))
     return df

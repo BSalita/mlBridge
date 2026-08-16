@@ -1402,6 +1402,41 @@ def json_to_sql_walk(tables,key,last_id,uid,value,primary_keys):
     return
 
 
+def db_cell_value(vvv):
+    """
+    Convert a json_to_sql_walk cell to the Python value stored in SQLite.
+
+    Matches the logical value that CreateSqlFile embeds (after SQL unquoting),
+    so Parquet → bound-parameter INSERT yields the same DB contents as
+    executescript() of the generated .data.sql text.
+    """
+    if isinstance(vvv, str):
+        return vvv
+    if vvv is None:
+        return None
+    if isinstance(vvv, list):
+        # Same encoding as CreateSqlFile list branch (without SQL quoting).
+        if len(vvv) > 0 and isinstance(vvv[0], str):
+            return '["' + '","'.join(str(x) for x in vvv) + '"]'
+        return '[' + ','.join(str(x) for x in vvv) + ']'
+    if isinstance(vvv, bool):
+        return int(vvv)
+    return vvv
+
+
+def tables_to_db_rows(tables):
+    """
+    Flatten json_to_sql_walk `tables` into {table_name: [row_dict, ...]}.
+    """
+    out = {}
+    for table_name, keyed_rows in tables.items():
+        rows = []
+        for row in keyed_rows.values():
+            rows.append({col: db_cell_value(val) for col, val in row.items()})
+        out[table_name] = rows
+    return out
+
+
 # Create a file of SQL INSERT commands from table
 def CreateSqlFile(tables,f,primary_keys):
     print("PRAGMA foreign_keys = OFF;", file=f) # is this still necessary????

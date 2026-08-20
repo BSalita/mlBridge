@@ -1525,7 +1525,12 @@ def create_acbl_browser_context(p, headless=True):
                     '--disable-blink-features=AutomationControlled',
                     '--no-first-run',
                     '--no-default-browser-check',
-                    f'--window-position={_OFFSCREEN_WINDOW_POS}',
+                    # Off-screen only on a real Windows desktop, where the headed
+                    # window would pop over the user. Under Xvfb in containers
+                    # there is no user to annoy, and screenX=-32000 is a bot
+                    # signal to Cloudflare Turnstile.
+                    *([f'--window-position={_OFFSCREEN_WINDOW_POS}'] if os.name == 'nt'
+                      else ['--window-position=0,0']),
                     f'--window-size={ACBL_VIEWPORT_WIDTH},{ACBL_VIEWPORT_HEIGHT}',
                     # Chrome refuses to run as root (typical in containers)
                     # with its sandbox enabled.

@@ -859,17 +859,18 @@ def create_club_dfs(data):
     dfs = {}
     event_df = pd.json_normalize(data,max_level=0) # todo: convert to polars
     dfs['event'] = pl.from_pandas(event_df)
-    for k,v in event_df.items():
-        if isinstance(v[0],dict) or isinstance(v[0],list):
+    # Snapshot (column, first value) pairs before the loop. The old code dropped
+    # columns from event_df while iterating .items(), which misaligned keys and
+    # values and crashed on scalar columns for newer ACBL session JSON
+    # (TypeError: object of type 'numpy.bool' has no len()).
+    for k, v0 in [(col, event_df[col].iloc[0]) for col in event_df.columns]:
+        if isinstance(v0,dict) or isinstance(v0,list):
             assert k not in dfs, k
-            df = pd.json_normalize(data,max_level=0)[k] # todo: convert to polars
-            # must test whether df is all scalers. Very difficult to debug.
-            if isinstance(v[0],dict) and not any([isinstance(vv,dict) or isinstance(vv,list) for kk,vv in df[0].items()]):
-                dfs[k] = pl.from_pandas(pd.DataFrame.from_records(df[0],index=[0])) # must use from_records to avoid 'all values are scaler must specify index' error
+            # must test whether v0 is all scalers. Very difficult to debug.
+            if isinstance(v0,dict) and not any([isinstance(vv,dict) or isinstance(vv,list) for vv in v0.values()]):
+                dfs[k] = pl.from_pandas(pd.DataFrame.from_records(v0,index=[0])) # must use from_records to avoid 'all values are scaler must specify index' error
             else:
-                dfs[k] = pl.from_pandas(pd.DataFrame.from_records(df[0]).astype('string')) # warning: needed astype('string') to avoid int error
-            event_df.drop(columns=[k],inplace=True)
-            #if all(isinstance(kk,int) or (isinstance(kk,str) and kk.isnumeric()) for kk,vv in v.items()):
+                dfs[k] = pl.from_pandas(pd.DataFrame.from_records(v0).astype('string')) # warning: needed astype('string') to avoid int error
     dfs['hand_records'] = pl.from_pandas(pd.json_normalize(data,['sessions','hand_records']))
     dfs['strat_place'] = pl.from_pandas(pd.json_normalize(data,['sessions','sections','pair_summaries','strat_place']))
     dfs['sections'] = pl.from_pandas(pd.json_normalize(data,['sessions','sections']))

@@ -91,6 +91,7 @@
 
 import polars as pl
 import pathlib
+import gc
 from collections import defaultdict
 from enum import Enum
 import time
@@ -2627,9 +2628,34 @@ def create_torch_shards(
 
         tensors: Dict[str, torch.Tensor] = {}
 
-        # Numeric: clean NaNs/Infs and optionally scale
-        numerical_data = shard_df.select(numerical_feature_cols).to_numpy().astype(np.float32)
-        np.nan_to_num(numerical_data, nan=0.0, posinf=1e6, neginf=-1e6, copy=False)
+        # Numeric: build ONE preallocated float32 matrix, filled in column
+        # batches, then clean NaN/Inf in row chunks.
+        #
+        # Memory rationale (Windows commit-limit OOMs, 2026-08-19): with the
+        # ~1.4 TB training df already resident, any full-shard-size temporary
+        # risks hitting the system commit limit. The one-shot forms failed
+        # twice at 6031 cols:
+        #   - to_numpy().astype(f32): float64 intermediate + astype copy
+        #     (~135 GiB transient at 2M rows) -> OOM at shard 7/31;
+        #   - select().cast(f32).to_numpy(): cast copy + numpy copy, and
+        #     nan_to_num internally allocates 3 full-size bool masks
+        #     -> OOM at shard 23/62 (couldn't get even 5.6 GiB).
+        # Column-batched fill + row-chunked nan_to_num caps extra commit at
+        # ~1-2 GB regardless of shard size.
+        n_rows = shard_df.height
+        numerical_data = np.empty((n_rows, len(numerical_feature_cols)), dtype=np.float32)
+        _COL_BATCH = 256
+        for j0 in range(0, len(numerical_feature_cols), _COL_BATCH):
+            batch_cols = numerical_feature_cols[j0:j0 + _COL_BATCH]
+            numerical_data[:, j0:j0 + len(batch_cols)] = (
+                shard_df.select(batch_cols).cast(pl.Float32).to_numpy()
+            )
+        _ROW_CHUNK = 100_000
+        for i0 in range(0, n_rows, _ROW_CHUNK):
+            np.nan_to_num(
+                numerical_data[i0:i0 + _ROW_CHUNK],
+                nan=0.0, posinf=1e6, neginf=-1e6, copy=False,
+            )
 
         if do_scale:
             for j, col in enumerate(numerical_feature_cols):
@@ -2707,6 +2733,11 @@ def create_torch_shards(
         torch.save(tensors, shard_path)
         written.append(shard_path)
         shard_index += 1
+        # Release shard-sized objects NOW rather than at next-iteration
+        # rebinding, so two shards' worth of tensors never coexist (matters
+        # when running near the Windows commit limit; see note above).
+        del tensors, numerical_data, categorical_data_list
+        gc.collect()
 
     return written
 

@@ -646,7 +646,8 @@ def download_tournament_player_history(player_id, acbl_api_key):
     while url:
         try:
             print_to_log_info(f'url:{url}')
-            print_to_log_info(f'headers:{headers}')
+            # Do not log headers: they contain the ACBL bearer token.
+            # print_to_log_info(f'headers:{headers}')
             response = requests.get(url, headers=headers)
             print_to_log_info(f'Status Code:{response.status_code}')
         except Exception as ex:

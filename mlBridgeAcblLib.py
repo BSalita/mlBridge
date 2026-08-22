@@ -1270,7 +1270,14 @@ def acbldf_to_mldf(df: pl.DataFrame) -> pl.DataFrame:
         df = df.rename({f'player_number_{d.lower()}': f'Player_ID_{d}'})
         df = df.rename({f'player_name_{d.lower()}': f'Player_Name_{d}'})
         df = df.with_columns([
-            pl.col(f'Player_ID_{d}').cast(pl.Utf8).alias(f'Player_ID_{d}'),
+            # pd.json_normalize promotes integer ACBL numbers to float when a
+            # player record is null/mixed. Casting that Float64 directly to
+            # text produces values such as "4182812.0"; remove only that
+            # pandas-int artifact while preserving nonnumeric temporary IDs.
+            pl.col(f'Player_ID_{d}')
+                .cast(pl.Utf8)
+                .str.replace(r'\.0$', '')
+                .alias(f'Player_ID_{d}'),
             #pl.col(f'Player_ID_{d}').cast(pl.UInt32).alias(f'iPlayer_Number_{d}'),
             pl.col(f'Player_Name_{d}').map_elements(last_first_to_first_last, return_dtype=pl.Utf8).alias(f'Player_Name_{d}')
         ])

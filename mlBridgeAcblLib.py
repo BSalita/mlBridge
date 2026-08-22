@@ -1260,10 +1260,12 @@ def acbldf_to_mldf(df: pl.DataFrame) -> pl.DataFrame:
 
     # Function to transform names into "first last" format
     def last_first_to_first_last(name):
-        # Replace commas with spaces and split
-        parts = name.replace(',', ' ').split()
-        # Return "first last" format
-        return ' '.join(parts[1:] + parts[:1]) if len(parts) > 1 else name
+        # Club JSON uses "Last, First"; the tournament API already supplies
+        # "First Last". Rotate only when the source explicitly has a comma.
+        if not name or ',' not in name:
+            return name
+        last, first = name.split(',', 1)
+        return f"{first.strip()} {last.strip()}".strip()
 
     # Transpose player names
     for d in 'NESW':

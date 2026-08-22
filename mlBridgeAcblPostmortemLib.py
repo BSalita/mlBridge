@@ -78,5 +78,18 @@ def build_tournament_postmortem(
         frames, session_data, {}, str(player_id))
     if merged is None:
         raise ValueError("Tournament session could not be normalized")
+    event = session_data.get("event") or {}
+    tournament = session_data.get("tournament") or {}
+    metadata = {
+        "event_name": event.get("name"),
+        "event_type": event.get("game_type"),
+        "board_scoring_method": section.get("scoring_type"),
+        "tournament_name": tournament.get("name"),
+    }
+    merged = merged.with_columns(
+        pl.lit(value).alias(name)
+        for name, value in metadata.items()
+        if name not in merged.columns
+    )
     return augment_postmortem_dataframe(
         merged, single_dummy_sample_count=single_dummy_sample_count)

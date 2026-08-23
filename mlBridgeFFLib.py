@@ -647,15 +647,19 @@ def convert_ffdf_api_to_mldf(ffldfs):
 
 
 def _lancelot_score_field_kind(score: str) -> str | None:
-    """Classify a Lancelot nsScore/ewScore field: 'digit', 'pass', or None if empty."""
+    """Classify a Lancelot nsScore/ewScore field: 'digit', 'pass', 'percent', or None."""
     s = (score or '').strip()
     if not s:
         return None
-    if s[0].isdigit():
-        return 'digit'
+    if '%' in s:  # banded/truncated pair % such as '60%+', '%Tou'
+        return 'percent'
     if s.upper().startswith('PASS'):  # PASS / PASSE / passe
         return 'pass'
-    return None
+    try:
+        int(s)
+        return 'digit'
+    except ValueError:
+        return None
 
 
 def _lancelot_trick_score_magnitude(ns_score: str, ew_score: str) -> int | None:
@@ -679,6 +683,11 @@ def _lancelot_signed_ns_score(ns_score: str, ew_score: str) -> int | None:
     """
     ns_kind = _lancelot_score_field_kind(ns_score)
     ew_kind = _lancelot_score_field_kind(ew_score)
+    if ns_kind == 'percent' or ew_kind == 'percent':
+        # Same banded string on both sides (e.g. '60%+' / '60%+') is a pair
+        # percentage, not two official trick scores. Score_NS stays null;
+        # Pct_NS / Pct_EW already come from nsNote / ewNote.
+        return None
     if ns_kind == 'digit' and ew_kind == 'digit':
         raise ValueError(
             f"Lancelot nsScore and ewScore both populated: {ns_score!r} / {ew_score!r}"

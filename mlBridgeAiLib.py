@@ -904,7 +904,8 @@ def apply_feature_scaling(
     data: np.ndarray,
     feature_names: List[str],
     scaling_params: Dict[str, Dict[str, float]],
-    apply_scaling: bool = True
+    apply_scaling: bool = True,
+    inplace: bool = False
 ) -> np.ndarray:
     """
     Apply per-feature standardization to a numpy array given scaling parameters.
@@ -912,7 +913,9 @@ def apply_feature_scaling(
     if not apply_scaling or not scaling_params:
         return data
 
-    scaled_data = data.copy()
+    # inplace=True avoids a full-size copy; essential on production-width
+    # matrices (~6k cols x millions of rows) where a copy is 100+ GB.
+    scaled_data = data if inplace else data.copy()
     for idx, feature in enumerate(feature_names):
         params = scaling_params.get(feature)
         if params is None:
@@ -921,6 +924,44 @@ def apply_feature_scaling(
         std = params.get("std", 1.0) or 1.0
         scaled_data[:, idx] = (scaled_data[:, idx] - mean) / std
     return scaled_data
+
+
+def df_to_float32_matrix(
+    df: pl.DataFrame,
+    cols: List[str],
+    *,
+    nan: float = 0.0,
+    posinf: float = 1e6,
+    neginf: float = -1e6,
+) -> np.ndarray:
+    """
+    Materialize df[cols] as one float32 numpy matrix with NaN/Inf cleaned,
+    without any full-size temporaries.
+
+    The naive select(cols).to_numpy().astype(np.float32) chain allocates a
+    float64 intermediate (2x the final size), an astype copy, and
+    nan_to_num's full-size bool masks. At production width (~6k cols x
+    millions of rows) those transients repeatedly exhausted the Windows
+    commit limit during ACBL stage 5c (OOMs on 2026-08-19 and 2026-08-24,
+    the latter a 373 GB Rust-side allocation failure at inference).
+
+    This fills a single preallocated float32 buffer in column batches and
+    cleans NaN/Inf in row chunks, capping extra commit at ~1-2 GB
+    regardless of input size. Callers should keep downstream ops in-place
+    (np.clip(..., out=), /=, torch.from_numpy) to preserve that property.
+    """
+    out = np.empty((df.height, len(cols)), dtype=np.float32)
+    _COL_BATCH = 256
+    for j0 in range(0, len(cols), _COL_BATCH):
+        batch = cols[j0:j0 + _COL_BATCH]
+        out[:, j0:j0 + len(batch)] = df.select(batch).cast(pl.Float32).to_numpy()
+    _ROW_CHUNK = 100_000
+    for i0 in range(0, out.shape[0], _ROW_CHUNK):
+        np.nan_to_num(
+            out[i0:i0 + _ROW_CHUNK],
+            nan=nan, posinf=posinf, neginf=neginf, copy=False,
+        )
+    return out
 
 
 def validate_dataframe_dtypes(
@@ -947,11 +988,32 @@ def validate_dataframe_dtypes(
     df_schema = dict(df.schema)
     mismatches = []
     conversions_needed = []
+    widening_casts = []
     
     # Treat String/Utf8/Categorical/Enum as equivalent — all encode to the same
     # integer-id pathway downstream, so a column emitted as Enum at data-prep
     # time should compare-equal to a Categorical reference in the on-disk schema.
     string_like_types = {'String', 'Utf8', 'Categorical', 'Enum'}
+
+    # Lossless widenings are auto-cast even in strict mode: e.g. a UInt32
+    # column can always be represented as the schema's UInt64. Strictness is
+    # meant to catch real drift (semantic/dtype-family changes), not parquet
+    # writers picking a narrower physical int for the same values (which
+    # failed tournament inference on 2026-08-25: Elo_N_* UInt32 vs UInt64).
+    _int_rank = {'Int8': 8, 'Int16': 16, 'Int32': 32, 'Int64': 64}
+    _uint_rank = {'UInt8': 8, 'UInt16': 16, 'UInt32': 32, 'UInt64': 64}
+
+    def is_lossless_widening(actual: str, expected: str) -> bool:
+        if actual == 'Float32' and expected == 'Float64':
+            return True
+        if actual in _uint_rank:
+            if expected in _uint_rank:
+                return _uint_rank[actual] <= _uint_rank[expected]
+            if expected in _int_rank:
+                return _uint_rank[actual] < _int_rank[expected]
+        if actual in _int_rank and expected in _int_rank:
+            return _int_rank[actual] <= _int_rank[expected]
+        return False
 
     def normalize_dtype_str(dtype_str: str) -> str:
         """Normalize dtype string by stripping categorical/enum ordering & vocab specs."""
@@ -980,9 +1042,19 @@ def validate_dataframe_dtypes(
             continue  # These are equivalent for our purposes
         
         if actual_normalized != expected_normalized:
-            mismatches.append(f"  {col}: expected {expected_dtype_str}, got {actual_dtype_str}")
-            conversions_needed.append((col, expected_dtype_str, actual_dtype_str))
-    
+            if is_lossless_widening(actual_normalized, expected_normalized):
+                widening_casts.append((col, expected_normalized, actual_dtype_str))
+            else:
+                mismatches.append(f"  {col}: expected {expected_dtype_str}, got {actual_dtype_str}")
+                conversions_needed.append((col, expected_dtype_str, actual_dtype_str))
+
+    if widening_casts:
+        preview = ", ".join(f"{c} {a}->{e}" for c, e, a in widening_casts[:8])
+        if len(widening_casts) > 8:
+            preview += f", ... ({len(widening_casts)} total)"
+        print(f"🔧 {context}: auto-widening column dtypes to match schema (lossless): {preview}")
+        df = df.with_columns([pl.col(c).cast(getattr(pl, e)) for c, e, _ in widening_casts])
+
     if mismatches:
         error_msg = f"Dtype mismatches in {context}:\n" + "\n".join(mismatches)
         
@@ -2041,23 +2113,23 @@ def df_to_scaled_tensors(df: pl.DataFrame, saved_models_path: pathlib.Path, mode
     scaling_params = schema.get('scaling_params', {})
     preprocessing = schema.get('preprocessing')
 
-    X_num = df.select(numerical_feature_cols).to_numpy().astype(np.float32)
-    X_num = np.nan_to_num(X_num, nan=0.0, posinf=1e6, neginf=-1e6)
+    # Preallocated f32 matrix + in-place ops: see df_to_float32_matrix (commit-limit OOMs).
+    X_num = df_to_float32_matrix(df, numerical_feature_cols)
 
     # NEW: Apply training-time preprocessing if present in schema
     if preprocessing:
         clip_low, clip_high = preprocessing.get('clip_range', (-100, 100))
         scale_factor = preprocessing.get('scale_factor', 1)
-        X_num = np.clip(X_num, clip_low, clip_high)
+        np.clip(X_num, clip_low, clip_high, out=X_num)
         if scale_factor and abs(scale_factor) != 1:
-            X_num = X_num / float(scale_factor)
+            X_num /= float(scale_factor)
     else:
         # Backward compatible mean/std scaling path
         do_scale = (scaling_mode == 'on') or (scaling_mode == 'auto' and schema.get('apply_scaling', False))
         if do_scale and scaling_params:
-            X_num = apply_feature_scaling(X_num, numerical_feature_cols, scaling_params, apply_scaling=True)
+            X_num = apply_feature_scaling(X_num, numerical_feature_cols, scaling_params, apply_scaling=True, inplace=True)
 
-    X_cont = torch.tensor(X_num, dtype=torch.float32)
+    X_cont = torch.from_numpy(X_num)
 
     X_cat = None
     if categorical_feature_cols:
@@ -2628,34 +2700,10 @@ def create_torch_shards(
 
         tensors: Dict[str, torch.Tensor] = {}
 
-        # Numeric: build ONE preallocated float32 matrix, filled in column
-        # batches, then clean NaN/Inf in row chunks.
-        #
-        # Memory rationale (Windows commit-limit OOMs, 2026-08-19): with the
-        # ~1.4 TB training df already resident, any full-shard-size temporary
-        # risks hitting the system commit limit. The one-shot forms failed
-        # twice at 6031 cols:
-        #   - to_numpy().astype(f32): float64 intermediate + astype copy
-        #     (~135 GiB transient at 2M rows) -> OOM at shard 7/31;
-        #   - select().cast(f32).to_numpy(): cast copy + numpy copy, and
-        #     nan_to_num internally allocates 3 full-size bool masks
-        #     -> OOM at shard 23/62 (couldn't get even 5.6 GiB).
-        # Column-batched fill + row-chunked nan_to_num caps extra commit at
-        # ~1-2 GB regardless of shard size.
-        n_rows = shard_df.height
-        numerical_data = np.empty((n_rows, len(numerical_feature_cols)), dtype=np.float32)
-        _COL_BATCH = 256
-        for j0 in range(0, len(numerical_feature_cols), _COL_BATCH):
-            batch_cols = numerical_feature_cols[j0:j0 + _COL_BATCH]
-            numerical_data[:, j0:j0 + len(batch_cols)] = (
-                shard_df.select(batch_cols).cast(pl.Float32).to_numpy()
-            )
-        _ROW_CHUNK = 100_000
-        for i0 in range(0, n_rows, _ROW_CHUNK):
-            np.nan_to_num(
-                numerical_data[i0:i0 + _ROW_CHUNK],
-                nan=0.0, posinf=1e6, neginf=-1e6, copy=False,
-            )
+        # Numeric: see df_to_float32_matrix -- with the ~1.4 TB training df
+        # resident, any full-shard-size temporary risks the commit limit
+        # (OOM'd at shard 7/31 on 2026-08-19, then 23/62 the same day).
+        numerical_data = df_to_float32_matrix(shard_df, numerical_feature_cols)
 
         if do_scale:
             for j, col in enumerate(numerical_feature_cols):
@@ -2777,9 +2825,8 @@ def iter_torch_shards_raw(
         end = min(start + shard_rows_count, df.height)
         shard_df = df.slice(start, end - start)
 
-        # Continuous
-        X_cont = shard_df.select(cont_cols).to_numpy().astype(np.float32)
-        np.nan_to_num(X_cont, nan=0.0, posinf=1e6, neginf=-1e6, copy=False)
+        # Continuous (see df_to_float32_matrix: avoids full-size temporaries)
+        X_cont = df_to_float32_matrix(shard_df, cont_cols)
 
         # Categorical: build per-shard vocab and indices
         cat_vocab: Dict[str, List[Any]] = {}
@@ -3972,19 +4019,19 @@ def predict_regression_model(saved_models_path: pathlib.Path, model_name: str, d
         finite_mask = np.isfinite(num_np).all(axis=1)
         feature_df = feature_df.filter(pl.Series(name="__mask__", values=finite_mask))
 
-    # Build continuous tensor with schema preprocessing (clip/scale) like classification path
-    X_num_np = feature_df.select(numerical_feature_cols).to_numpy().astype(np.float32)
-    X_num_np = np.nan_to_num(X_num_np, nan=0.0, posinf=1e6, neginf=-1e6)
+    # Build continuous tensor with schema preprocessing (clip/scale) like classification path.
+    # Preallocated f32 matrix + in-place ops: see df_to_float32_matrix (commit-limit OOMs).
+    X_num_np = df_to_float32_matrix(feature_df, numerical_feature_cols)
     preprocessing = schema.get('preprocessing')
     if preprocessing:
         clip_low, clip_high = preprocessing.get('clip_range', [-100, 100])
         scale_factor = preprocessing.get('scale_factor', 1)
-        X_num_np = np.clip(X_num_np, clip_low, clip_high)
+        np.clip(X_num_np, clip_low, clip_high, out=X_num_np)
         if scale_factor and abs(scale_factor) != 1:
-            X_num_np = X_num_np / float(scale_factor)
+            X_num_np /= float(scale_factor)
     elif apply_scaling and scaling_params:
-        X_num_np = apply_feature_scaling(X_num_np, numerical_feature_cols, scaling_params, apply_scaling=True)
-    Xc = torch.tensor(X_num_np, dtype=torch.float32)
+        X_num_np = apply_feature_scaling(X_num_np, numerical_feature_cols, scaling_params, apply_scaling=True, inplace=True)
+    Xc = torch.from_numpy(X_num_np)
     Xk = build_categorical_tensor(
         feature_df,
         categorical_feature_cols=categorical_feature_cols,
@@ -4458,24 +4505,26 @@ def predict_classification_model(
         print(f"   DEBUG: Missing numerical columns: {numerical_missing[:10]}")
     print(f"   DEBUG: Found {len(numerical_in_df)} numerical columns in DataFrame")
     
-    X_num = test_subset_df.select(numerical_feature_cols).to_numpy().astype(np.float32)
-    X_num = np.nan_to_num(X_num, nan=0.0, posinf=1e6, neginf=-1e6)
+    # Single preallocated f32 matrix + in-place clip/scale + zero-copy tensor:
+    # the previous one-shot to_numpy().astype() chain aborted with a 373 GB
+    # Rust allocation at 7.7M rows x 6031 cols (2026-08-24).
+    X_num = df_to_float32_matrix(test_subset_df, numerical_feature_cols)
     preprocessing = schema.get('preprocessing')
     if preprocessing:
         clip_low, clip_high = preprocessing.get('clip_range', [-100, 100])
         scale_factor = preprocessing.get('scale_factor', 1)
-        X_num = np.clip(X_num, clip_low, clip_high)
+        np.clip(X_num, clip_low, clip_high, out=X_num)
         if scale_factor and abs(scale_factor) != 1:
-            X_num = X_num / float(scale_factor)
+            X_num /= float(scale_factor)
     elif apply_scaling and scaling_params:
         # Backward compatibility: mean/std scaling path
-        X_num = apply_feature_scaling(X_num, numerical_feature_cols, scaling_params, apply_scaling=True)
+        X_num = apply_feature_scaling(X_num, numerical_feature_cols, scaling_params, apply_scaling=True, inplace=True)
     # DEBUG: numeric tensor stats for classification
     try:
         print(f"DEBUG[CLS] Numeric tensor stats (n={X_num.shape[0]}): mean={np.mean(X_num):.6f}, std={np.std(X_num):.6f}, min={np.min(X_num):.6f}, max={np.max(X_num):.6f}")
     except Exception:
         pass
-    Xc = torch.tensor(X_num, dtype=torch.float32)
+    Xc = torch.from_numpy(X_num)
     Xk = build_categorical_tensor(
         test_subset_df,
         categorical_feature_cols=categorical_feature_cols,

@@ -701,6 +701,18 @@ def _lancelot_signed_ns_score(ns_score: str, ew_score: str) -> int | None:
     return None
 
 
+def _lancelot_contract_result(result: str) -> int | None:
+    """Convert a Lancelot contract result; a lone dash means no Bridgemate result."""
+    value = (result or '').strip()
+    if value == '-':
+        return None
+    if value.startswith('+'):
+        return int(value[1:])
+    if value.startswith('-'):
+        return int(value)
+    return 0
+
+
 # this function uses lancelot api to create mldf.
 # todo: update with newer algorithms from convert_ffdf_to_mldf().
 def convert_ffdf_lancelot_to_mldf(ffdf):
@@ -753,12 +765,8 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
             .alias('Contract'),
         # 'O' (Ouest) guards against French direction notation; the data is normally English N/E/S/W.
         pl.col('declarer').replace('O', 'W').alias('Declarer'),
-        pl.when(pl.col('result').str.starts_with('+'))
-            .then(pl.col('result').str.slice(1))  # Remove '+'
-            .when(pl.col('result').str.starts_with('-'))
-            .then(pl.col('result'))
-            .otherwise(pl.lit('0'))  # Replace '=' with '0'
-            .cast(pl.Int16)
+        pl.col('result')
+            .map_elements(_lancelot_contract_result, return_dtype=pl.Int16)
             .alias('Result'),
         # Populated nsScore/ewScore = side that received positive trick points (not notes).
         pl.struct(['nsScore', 'ewScore'])

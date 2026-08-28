@@ -498,10 +498,25 @@ def match_ranking_to_session(
             "club_handicap_percentage": _row_pct(club_handicap),
             "club_scratch_rank": None if club_scratch is None else club_scratch.get("local_rank"),
             "club_handicap_rank": None if club_handicap is None else club_handicap.get("local_rank"),
+            "theoretical_rank": (
+                _row_rank(club_handicap)
+                or _row_rank(club_scratch)
+                or _row_rank(national_handicap)
+                or _row_rank(national_scratch)
+            ),
             "scratch_url": session.get("scratch_url"),
             "handicap_url": session.get("handicap_url"),
         }
     return scores
+
+
+def _row_rank(row: Optional[Dict[str, Any]], field: str = "theoretical_rank") -> Optional[int]:
+    if row is None:
+        return None
+    value = row.get(field)
+    if value is None or value == "":
+        return None
+    return int(value)
 
 
 def _row_pct(row: Optional[Dict[str, Any]]) -> Optional[float]:
@@ -545,17 +560,24 @@ def fill_missing_club_pcts(
     series_ids: Iterable[int] = BI_SERIES_IDS,
     show_progress: bool = True,
 ) -> pl.DataFrame:
-    """Fill null Club_Scratch_Pct / Club_Handicap_Pct from BridgeInterNet club tables.
+    """Fill null club percentages and Theoretical_Rank from BridgeInterNet tables.
 
     Only rows whose date falls on a BI game day and whose series is 384 or 386
-    are considered. Existing non-null club percentages are left unchanged.
-    Ambiguous surname matches stay null.
+    are considered. Existing non-null values are left unchanged. Ambiguous
+    surname matches stay null. Lancelot did not publish theoreticalRank before
+    about 2026-07-01; organizer pages still have a Théo column for older dates.
     """
     required = {"date", "series_id", "player1_name", "player2_name"}
     missing = required - set(results_df.columns)
     if missing:
         raise ValueError(f"results_df missing columns: {sorted(missing)}")
-    for column in ("Club_Scratch_Pct", "Club_Handicap_Pct", "Club_Scratch_Rank", "Club_Handicap_Rank"):
+    for column in (
+        "Club_Scratch_Pct",
+        "Club_Handicap_Pct",
+        "Club_Scratch_Rank",
+        "Club_Handicap_Rank",
+        "Theoretical_Rank",
+    ):
         if column not in results_df.columns:
             dtype = pl.Float64 if column.endswith("_Pct") else pl.Int64
             results_df = results_df.with_columns(pl.lit(None).cast(dtype).alias(column))
@@ -571,7 +593,9 @@ def fill_missing_club_pcts(
     if date_to:
         candidates = candidates.filter(pl.col("_bi_date") <= date_to[:10])
     candidates = candidates.filter(
-        pl.col("Club_Scratch_Pct").is_null() | pl.col("Club_Handicap_Pct").is_null()
+        pl.col("Club_Scratch_Pct").is_null()
+        | pl.col("Club_Handicap_Pct").is_null()
+        | pl.col("Theoretical_Rank").is_null()
     )
     dates = sorted({row["_bi_date"] for row in candidates.select("_bi_date").unique().to_dicts()})
     bi_dates = [day for day in dates if game_for_date(day) is not None]
@@ -585,6 +609,11 @@ def fill_missing_club_pcts(
     handicap_pct = results_df["Club_Handicap_Pct"].to_list()
     scratch_rank = results_df["Club_Scratch_Rank"].to_list()
     handicap_rank = results_df["Club_Handicap_Rank"].to_list()
+    theoretical_rank = results_df["Theoretical_Rank"].to_list()
+    has_lowercase_theo = "theoretical_rank" in results_df.columns
+    lowercase_theo = (
+        results_df["theoretical_rank"].to_list() if has_lowercase_theo else None
+    )
     date_values = results_df["date"].cast(pl.Utf8).str.slice(0, 10).to_list()
     series_values = results_df["series_id"].to_list()
     p1_values = results_df["player1_name"].to_list()
@@ -611,6 +640,12 @@ def fill_missing_club_pcts(
             surname2 = _surname_token(str(name2 or ""))
             club_scratch = match_unique_row(session["club_scratch"], surname1, surname2)
             club_handicap = match_unique_row(session["club_handicap"], surname1, surname2)
+            national_scratch = match_unique_row(
+                session["national_scratch"], surname1, surname2
+            )
+            national_handicap = match_unique_row(
+                session["national_handicap"], surname1, surname2
+            )
             if club_scratch is not None and scratch_pct[index] is None:
                 scratch_pct[index] = club_scratch["percentage"]
                 if scratch_rank[index] is None:
@@ -621,6 +656,18 @@ def fill_missing_club_pcts(
                 if handicap_rank[index] is None:
                     handicap_rank[index] = club_handicap.get("local_rank")
                 filled += 1
+            if theoretical_rank[index] is None:
+                theo = (
+                    _row_rank(club_handicap)
+                    or _row_rank(club_scratch)
+                    or _row_rank(national_handicap)
+                    or _row_rank(national_scratch)
+                )
+                if theo is not None:
+                    theoretical_rank[index] = theo
+                    if lowercase_theo is not None and lowercase_theo[index] is None:
+                        lowercase_theo[index] = theo
+                    filled += 1
 
     elapsed = (datetime.now() - started).total_seconds()
     print(
@@ -628,11 +675,17 @@ def fill_missing_club_pcts(
         f"filled_values={filled} elapsed={elapsed:.1f}s",
         flush=True,
     )
+    updated = {
+        "Club_Scratch_Pct": scratch_pct,
+        "Club_Handicap_Pct": handicap_pct,
+        "Club_Scratch_Rank": scratch_rank,
+        "Club_Handicap_Rank": handicap_rank,
+        "Theoretical_Rank": theoretical_rank,
+    }
+    if lowercase_theo is not None:
+        updated["theoretical_rank"] = lowercase_theo
     return results_df.with_columns(
-        pl.Series("Club_Scratch_Pct", scratch_pct),
-        pl.Series("Club_Handicap_Pct", handicap_pct),
-        pl.Series("Club_Scratch_Rank", scratch_rank),
-        pl.Series("Club_Handicap_Rank", handicap_rank),
+        [pl.Series(name, values) for name, values in updated.items()]
     )
 
 

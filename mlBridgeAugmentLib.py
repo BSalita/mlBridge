@@ -51,7 +51,7 @@ from mlBridge.mlBridgeLib import (
     PairDirectionToOpponentPairDirection,
     ContractToScores
 )
-from logging_config import setup_logger
+from mlBridge.logging_config import setup_logger
 
 # Initialize logger for this module
 logger = setup_logger(__name__)

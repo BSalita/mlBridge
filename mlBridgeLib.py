@@ -11,7 +11,7 @@
 
 
 import logging
-from logging_config import setup_logger
+from mlBridge.logging_config import setup_logger
 logger = setup_logger(__name__)
 def print_to_log_info(*args):
     print_to_log(logging.INFO, *args)
@@ -27,8 +27,7 @@ import os
 import pathlib
 from collections import defaultdict
 import re
-from sklearn import preprocessing
-import matplotlib.pyplot as plt
+# sklearn is imported lazily where used (LabelEncoder) to keep package import light
 #from IPython.display import display  # needed for VSCode
 
 # for double and single dummy calculations
@@ -1165,6 +1164,7 @@ def Categorify(df):
 
     stringColumns = df.select_dtypes(['string']).columns
 
+    from sklearn import preprocessing
     le = preprocessing.LabelEncoder()
 
     for col in stringColumns:

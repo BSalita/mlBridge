@@ -1,5 +1,5 @@
-import hands
-import dds
+from mlBridge import hands
+from mlBridge import dds
 import ctypes
 
 def PrintFut(title, fut):

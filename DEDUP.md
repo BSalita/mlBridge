@@ -6,31 +6,38 @@ FFBridge app, BBO bidding tools, etc.).
 
 ## How sharing works
 
-Other subprojects do not vendor copies of these files. Instead they create a
-Windows junction back to this directory using each project's `mklinks.bat`,
-typically:
+Other subprojects do not vendor copies of these files. The package ROOT (this
+directory's parent, i.e. `src/`) is put on `sys.path`, either by the venv's
+`site-packages/monorepo_src.pth` or by a small resolver at the top of each app
+entry point. All imports are package-style:
 
-```bat
-mklink /J mlBridge ..\..\mlBridge
+```python
+from mlBridge.mlBridgeAugmentLib import AllAugmentations
+from mlBridge import mlBridgeFFLib
 ```
 
-The subproject's `sys.path.append(... / 'mlBridge')` then resolves to this
-canonical directory. Imports look like `from mlBridge.mlBridgeAugmentLib import ...`.
+Never put THIS directory itself on `sys.path` and never use flat imports
+(`import mlBridgeFFLib`). The package `__init__` is lazy (PEP 562), so package
+imports are cheap; heavy dependencies (sklearn, torch, sqlalchemy) load only
+when a symbol from their owning module is first touched.
+
+Windows junctions (`mklink /J mlBridge ...`) are obsolete and should not be
+recreated.
 
 ## "Duplicate" copies you may see in the workspace
 
 You will find files with the same name under at least two other paths:
 
-- `src/ffbridge/ffbridge-postmortem/src/mlbridgelib/mlBridge/`
-- `src/github-tests/ffbridge-postmortem/mlBridge/`
+- `src/postmortem-ffbridge/src/mlbridgelib/mlBridge/`
+- `src/_archive/github-tests/ffbridge-postmortem/mlBridge/`
 
 Both of these directories live **inside other, independent git repositories**
-(`src/ffbridge/ffbridge-postmortem/.git`, `src/github-tests/ffbridge-postmortem/.git`).
+(`src/postmortem-ffbridge/.git`, `src/_archive/github-tests/ffbridge-postmortem/.git`).
 They are vendored snapshots owned by those external repos, not by this workspace.
 
 **Do not edit them.** They are out-of-date and not imported by any active code
-path here — `ffbridge_streamlit.py` (the live one) imports from the junction
-created by `mklinks.bat`, which points back to *this* directory.
+path here — `ffbridge_streamlit.py` (the live one) imports the `mlBridge`
+package from the `src/` root on `sys.path`, which resolves to *this* directory.
 
 If you need to refresh those vendored copies, do it inside their own git repos
 as a separate exercise.

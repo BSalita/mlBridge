@@ -1,9 +1,9 @@
 # Assume all ACBL double dummy and par calculations are wrong! Recompute both.
 
 from mlBridge.mlBridge import NESW, vul_dds_d, NSHDC, seats
-import dds
+from mlBridge import dds
 import ctypes
-import functions
+from mlBridge import functions
 
 
 # valdiate calculated par result by comparing against known (assumed) correct par. Similar to functions.ComparePar().

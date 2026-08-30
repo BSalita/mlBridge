@@ -61,7 +61,7 @@ def default_index_dir() -> pathlib.Path:
         return production_root / "player_session_index"
     return (
         pathlib.Path(__file__).resolve().parent.parent
-        / "Elo_Ratings"
+        / "elo"
         / "data"
         / "ffbridge"
         / "player_session_index"

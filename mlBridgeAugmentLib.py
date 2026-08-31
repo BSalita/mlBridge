@@ -5149,7 +5149,7 @@ def add_best_contract_ev(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
-    """Create declarer/opponent/lead position columns and derived scores.
+    """Create declarer/opponent/lead position columns and board-quality fields.
 
     Purpose:
     - Generate positional role assignments for all players at the table
@@ -5166,20 +5166,38 @@ def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
     - `Declarer_Pair_Direction`: Partnership of the declarer (NS/EW)
     - `BidSuit`, `BidLvl`, `Contract`: Contract specification
     - `Score_NS`, `Score_EW`: Partnership scores
-    - `Par_NS`, `Par_EW`: Theoretical par scores
+    - `Par_NS`, `Par_EW`: Directional theoretical par scores
+    - `DD_Score_NS`, `DD_Score_EW`: Directional double-dummy scores
+    - `DD_Score_Declarer`: Double-dummy score from the declaring side
+    - `ParContracts`: Optimal contracts, including each contract's `Strain`
 
     Output columns:
     - `Declarer`: Declarer player identifier
     - `Direction_OnLead`: Direction of opening leader
     - `EV_Score_Col_Declarer`: Expected value column reference for declarer
     - `Score_Declarer`, `Par_Declarer`: Declarer-specific scores
+    - `Par_Contract_NS`, `Par_Contract_EW`: Directional signed quality scores;
+      +1 when the directional DD score is at least par, otherwise -1. Missing
+      DD/par inputs produce null.
+    - `Is_Par_Contract`: Whether the declaring pair's directional Par Contract
+      score is +1.
+    - `Is_Par_Suit`: Whether the declared `BidSuit` occurs in
+      `ParContracts.Strain`.
+    - `Is_Sacrifice_Opportunity`: Whether the declaring pair has negative par.
+    - `Is_Sacrifice`: Whether the declaring pair's DD score equals its
+      directional par score when that par score is negative.
     - `Defender_Pair_Direction`: Defending partnership (non-declarer pair)
     - `Direction_Dummy`, `Dummy`: Dummy position and player identifier
     - `OnLead`, `Direction_NotOnLead`, `NotOnLead`: Lead and defensive position assignments
     - `Defender_Par_GE`: Defensive par performance indicator
 
     Returns:
-    - DataFrame with added positional role and derived scoring columns
+    - DataFrame with added positional role and derived scoring columns.
+
+    Notes:
+    - The report metric ``T-DD`` is intentionally not redefined here. It remains
+      the declarer-only ``Tricks - DD_Tricks`` value emitted as
+      ``DD_Tricks_Diff`` by :func:`create_score_diff_columns`.
     """
     return (
         df.with_columns([
@@ -5195,16 +5213,51 @@ def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
             pl.struct(['Contract','Declarer_Pair_Direction', 'Score_NS', 'Score_EW']).map_elements(
                 lambda r: 0 if r['Contract'] == 'PASS' else (None if r['Declarer_Pair_Direction'] is None else r[f"Score_{r['Declarer_Pair_Direction']}"]), return_dtype=pl.Int16
             ).alias('Score_Declarer'),
-            pl.when(pl.col('Declarer_Pair_Direction').eq(pl.lit('NS'))).then(pl.col('Par_NS')).otherwise(pl.col('Par_EW')).alias('Par_Declarer'),
+            pl.when(pl.col('Declarer_Pair_Direction').eq(pl.lit('NS')))
+            .then(pl.col('Par_NS'))
+            .when(pl.col('Declarer_Pair_Direction').eq(pl.lit('EW')))
+            .then(pl.col('Par_EW'))
+            .otherwise(None)
+            .alias('Par_Declarer'),
         ])
-        # Add columns for par achievements
-        # Is_Par_Suit: True when the declarer achieved par for the best suit
-        # Is_Par_Contract: True when the declarer achieved par for their actual contract
-        # Is_Sacrifice: True when the declarer achieved par for their actual contract
         .with_columns([
-            pl.col('Par_Declarer').eq(pl.col('DD_Score_Max_Declarer')).alias('Is_Par_Suit'),
-            pl.col('Par_Declarer').eq(pl.col('DD_Score_Declarer')).alias('Is_Par_Contract'),
-            (pl.col('Par_Declarer').eq(pl.col('DD_Score_Declarer')) & pl.col('DD_Score_Declarer').lt(0)).alias('Is_Sacrifice')
+            pl.when(pl.col('DD_Score_NS').is_null() | pl.col('Par_NS').is_null())
+            .then(None)
+            .when(pl.col('DD_Score_NS').ge(pl.col('Par_NS')))
+            .then(pl.lit(1, dtype=pl.Int8))
+            .otherwise(pl.lit(-1, dtype=pl.Int8))
+            .alias('Par_Contract_NS'),
+            pl.when(pl.col('DD_Score_EW').is_null() | pl.col('Par_EW').is_null())
+            .then(None)
+            .when(pl.col('DD_Score_EW').ge(pl.col('Par_EW')))
+            .then(pl.lit(1, dtype=pl.Int8))
+            .otherwise(pl.lit(-1, dtype=pl.Int8))
+            .alias('Par_Contract_EW'),
+            pl.struct(['BidSuit', 'ParContracts']).map_elements(
+                lambda r: (
+                    None
+                    if r['BidSuit'] is None or r['ParContracts'] is None
+                    else any(
+                        contract is not None
+                        and contract.get('Strain') == r['BidSuit']
+                        for contract in r['ParContracts']
+                    )
+                ),
+                return_dtype=pl.Boolean,
+            ).alias('Is_Par_Suit'),
+            pl.col('Par_Declarer').lt(0).alias('Is_Sacrifice_Opportunity'),
+            (
+                pl.col('DD_Score_Declarer').eq(pl.col('Par_Declarer'))
+                & pl.col('Par_Declarer').lt(0)
+            ).alias('Is_Sacrifice'),
+        ])
+        .with_columns([
+            pl.when(pl.col('Declarer_Pair_Direction').eq('NS'))
+            .then(pl.col('Par_Contract_NS').eq(1))
+            .when(pl.col('Declarer_Pair_Direction').eq('EW'))
+            .then(pl.col('Par_Contract_EW').eq(1))
+            .otherwise(None)
+            .alias('Is_Par_Contract'),
         ])
         .with_columns([
             pl.col('Declarer_Pair_Direction').replace_strict(PairDirectionToOpponentPairDirection).alias('Defender_Pair_Direction'),
@@ -6673,11 +6726,14 @@ def create_score_diff_columns(df: pl.DataFrame) -> pl.DataFrame:
 
     Output columns:
     - `Par_Diff_NS`, `Par_Diff_EW`: Score difference vs par (pl.Int16)
-    - `DD_Tricks_Diff`: Trick difference vs double-dummy (pl.Int8)
+    - `DD_Tricks_Diff`: Declarer-only T-DD metric, exactly
+      `Tricks - DD_Tricks` (pl.Int8)
     - `EV_Max_Diff_NS`, `EV_Max_Diff_EW`: Score difference vs maximum EV (pl.Float32)
 
     Returns:
-    - DataFrame with added performance difference columns
+    - DataFrame with added performance difference columns. Consumers must
+      attribute `DD_Tricks_Diff` only to `Declarer_Direction` (or the declaring
+      partnership), never to defenders.
     """
     out = df.with_columns([
         (pl.col('Score_NS') - pl.col('Par_NS')).cast(pl.Int16).alias('Par_Diff_NS'),

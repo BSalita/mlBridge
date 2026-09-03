@@ -172,6 +172,21 @@ def _load_dll() -> bool:
 _load_dll()
 
 
+def engine_info() -> dict:
+    """Return the live DD engine used by solve_dd_for_deals()."""
+    if DDSS_AVAILABLE and _DLL_PATH is not None:
+        return {"engine": "ddss", "path": str(_DLL_PATH)}
+    return {"engine": "endplay", "path": None}
+
+
+def engine_caption() -> str:
+    """One-line footer: which DD library is loaded (ddss vs endplay's dds)."""
+    info = engine_info()
+    if info["engine"] == "ddss":
+        return f"DDS: ddss ({info['path']})"
+    return "DDS: endplay (endplay's bundled dds; ddss not loaded)"
+
+
 def calc_all_tables_pbnx(
     pbn_strings: List[str],
     mode: int = -1,

@@ -55,6 +55,26 @@ class ddTableDealPBN(ctypes.Structure):
     _fields_ = [("cards", ctypes.c_char * 80)]
 
 
+class _DdssDDSInfo(ctypes.Structure):
+    """ctypes layout for ddss GetDDSInfo (include/dll.h)."""
+
+    _fields_ = [
+        ("major", ctypes.c_int),
+        ("minor", ctypes.c_int),
+        ("patch", ctypes.c_int),
+        ("versionString", ctypes.c_char * 10),
+        ("system", ctypes.c_int),
+        ("numBits", ctypes.c_int),
+        ("compiler", ctypes.c_int),
+        ("constructor", ctypes.c_int),
+        ("numCores", ctypes.c_int),
+        ("threading", ctypes.c_int),
+        ("noOfThreads", ctypes.c_int),
+        ("threadSizes", ctypes.c_char * 128),
+        ("systemString", ctypes.c_char * 1024),
+    ]
+
+
 class ddTableResults(ctypes.Structure):
     _fields_ = [("resTable", (ctypes.c_int * 4) * 5)]  # [strain][hand]
 
@@ -172,19 +192,67 @@ def _load_dll() -> bool:
 _load_dll()
 
 
+def _dds_version_from_get_info(dll, info_cls) -> Optional[str]:
+    """Read DDS versionString via GetDDSInfo from a loaded dds/ddss DLL."""
+    try:
+        get_info = dll.GetDDSInfo
+        get_info.argtypes = [ctypes.POINTER(info_cls)]
+        get_info.restype = None
+        info = info_cls()
+        get_info(ctypes.byref(info))
+        version = info.versionString.decode("ascii", errors="replace").strip("\x00").strip()
+        if version:
+            return version
+        return f"{info.major}.{info.minor}.{info.patch}"
+    except Exception:
+        return None
+
+
+def _ddss_dds_version() -> Optional[str]:
+    if not DDSS_AVAILABLE or _dll is None:
+        return None
+    return _dds_version_from_get_info(_dll, _DdssDDSInfo)
+
+
+def _endplay_dds_version() -> Optional[str]:
+    try:
+        import endplay._dds as ep_dds
+    except Exception:
+        return None
+    return _dds_version_from_get_info(ep_dds._dll, ep_dds.DDSInfo)
+
+
 def engine_info() -> dict:
     """Return the live DD engine used by solve_dd_for_deals()."""
     if DDSS_AVAILABLE and _DLL_PATH is not None:
-        return {"engine": "ddss", "path": str(_DLL_PATH)}
-    return {"engine": "endplay", "path": None}
+        return {
+            "engine": "ddss",
+            "path": str(_DLL_PATH),
+            "dds_version": _ddss_dds_version(),
+        }
+    endplay_version = None
+    try:
+        import endplay
+
+        endplay_version = endplay.__version__
+    except Exception:
+        pass
+    return {
+        "engine": "endplay",
+        "path": None,
+        "dds_version": _endplay_dds_version(),
+        "endplay_version": endplay_version,
+    }
 
 
 def engine_caption() -> str:
-    """One-line footer: which DD library is loaded (ddss vs endplay's dds)."""
+    """One-line label: which DD library is loaded and its version."""
     info = engine_info()
+    dds_version = info.get("dds_version") or "?"
     if info["engine"] == "ddss":
-        return f"DDS: ddss ({info['path']})"
-    return "DDS: endplay (endplay's bundled dds; ddss not loaded)"
+        return f"DDS: ddss {dds_version}"
+    endplay_version = info.get("endplay_version") or "?"
+    return f"DDS: endplay dds {dds_version} (endplay {endplay_version})"
 
 
 def calc_all_tables_pbnx(

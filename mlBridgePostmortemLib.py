@@ -21,6 +21,11 @@ from typing import Dict, List, Optional, Any, Union
 
 from mlBridge.mlBridgeLib import cast_numeric_display_columns
 
+try:
+    import streamlitlib
+except ImportError:
+    streamlitlib = None
+
 # todo: shouldn't other methods be abstract and initialized in main()?
 class PostmortemBase(ABC):
     """Base class containing standard mlBridge code shared across applications."""
@@ -413,6 +418,8 @@ class PostmortemBase(ABC):
             
             # Display report header
             st.markdown('<div style="height: 50px;"><a name="top-of-report"></a></div>', unsafe_allow_html=True)
+            if streamlitlib is not None:
+                streamlitlib.render_report_status_caption(st)
             st.markdown(f"### {report_title}")
             st.markdown(f"##### {report_creator}")
             if report_event_info:

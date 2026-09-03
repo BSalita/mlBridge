@@ -4152,6 +4152,10 @@ def compute_pair_matchpoint_elo_ratings(
                 s_ns = pct_ns[i]
                 if s_ns is not None and not (isinstance(s_ns, float) and np.isnan(s_ns)):
                     s_ns_f = float(s_ns)
+                    # Skip corrupt matchpoint percentages. Do not clamp 9.99
+                    # to 1.0 — that would still apply a ~50-point residual.
+                    if s_ns_f < 0.0 or s_ns_f > 1.0:
+                        continue
                     if score_amplifier != 1.0:
                         s_ns_f = 0.5 + score_amplifier * (s_ns_f - 0.5)
                         if s_ns_f < 0.0:
@@ -4522,6 +4526,10 @@ def compute_player_matchpoint_elo_ratings(
                 s_ns = pct_ns[i]
                 if s_ns is not None and not (isinstance(s_ns, float) and np.isnan(s_ns)):
                     s_ns_f = float(s_ns)
+                    # Skip corrupt matchpoint percentages. Do not clamp 9.99
+                    # to 1.0 — that would still apply a ~50-point residual.
+                    if s_ns_f < 0.0 or s_ns_f > 1.0:
+                        continue
                     if score_amplifier != 1.0:
                         s_ns_f = 0.5 + score_amplifier * (s_ns_f - 0.5)
                         if s_ns_f < 0.0:

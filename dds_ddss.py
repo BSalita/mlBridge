@@ -11,6 +11,7 @@ calling any functions.
 """
 
 import ctypes
+import os
 import pathlib
 import sys
 from typing import List, Optional
@@ -18,10 +19,36 @@ from typing import List, Optional
 import endplay._dds as endplay_dds
 
 # TODO: how can ddss dll be made available? Does it ddss need to be made available as a package like endplay?
-_DLL_PATH = pathlib.Path(r"C:\sw\bridge\ML-Contract-Bridge\src\ddss\build-cmake\Release\dds.dll")
+_WIN_DLL_PATH = pathlib.Path(r"C:\sw\bridge\ML-Contract-Bridge\src\ddss\build-cmake\Release\dds.dll")
+_LINUX_SO_PATH = pathlib.Path("/usr/local/lib/libdds.so")
 
 DDSS_AVAILABLE = False
 _dll = None
+_DLL_PATH = None
+
+
+def _dll_candidates() -> List[pathlib.Path]:
+    """Search order: DDSS_DLL_PATH, then the platform install / build paths."""
+    paths: List[pathlib.Path] = []
+    env = os.environ.get("DDSS_DLL_PATH")
+    if env:
+        paths.append(pathlib.Path(env))
+    if sys.platform == "win32":
+        paths.append(_WIN_DLL_PATH)
+    else:
+        paths.append(_LINUX_SO_PATH)
+        repo_root = pathlib.Path(__file__).resolve().parents[1]
+        paths.append(repo_root / "ddss" / "dist" / "linux-x86_64" / "libdds.so")
+        paths.append(repo_root / "ddss" / "build-linux" / "libdds.so")
+    # Preserve order, drop duplicates.
+    seen = set()
+    unique: List[pathlib.Path] = []
+    for path in paths:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
 
 
 class ddTableDealPBN(ctypes.Structure):
@@ -99,39 +126,47 @@ class DDSSResult:
 
 
 def _load_dll() -> bool:
-    global _dll, DDSS_AVAILABLE
-    if not _DLL_PATH.exists():
-        print(f"ddss DLL not found at {_DLL_PATH}. Falling back to endplay DDS.")
+    global _dll, DDSS_AVAILABLE, _DLL_PATH
+    candidates = _dll_candidates()
+    existing = [path for path in candidates if path.is_file()]
+    if not existing:
+        tried = ", ".join(str(path) for path in candidates)
+        print(f"ddss DLL not found (tried {tried}). Falling back to endplay DDS.")
         return False
-    try:
-        if sys.platform == "win32":
-            _dll = ctypes.WinDLL(str(_DLL_PATH))
-        else:
-            _dll = ctypes.CDLL(str(_DLL_PATH))
+    last_error = None
+    for path in existing:
+        try:
+            if sys.platform == "win32":
+                loaded = ctypes.WinDLL(str(path))
+            else:
+                loaded = ctypes.CDLL(str(path))
 
-        _dll.CalcAllTablesPBNx.restype = ctypes.c_int
-        _dll.CalcAllTablesPBNx.argtypes = [
-            ctypes.c_int,
-            ctypes.POINTER(ddTableDealPBN),
-            ctypes.c_int,
-            ctypes.c_int * 5,
-            ctypes.POINTER(ddTableResults),
-            ctypes.POINTER(parResults),
-        ]
+            loaded.CalcAllTablesPBNx.restype = ctypes.c_int
+            loaded.CalcAllTablesPBNx.argtypes = [
+                ctypes.c_int,
+                ctypes.POINTER(ddTableDealPBN),
+                ctypes.c_int,
+                ctypes.c_int * 5,
+                ctypes.POINTER(ddTableResults),
+                ctypes.POINTER(parResults),
+            ]
 
-        _dll.SetMaxThreads.restype = None
-        _dll.SetMaxThreads.argtypes = [ctypes.c_int]
-        _dll.SetMaxThreads(0)
+            loaded.SetMaxThreads.restype = None
+            loaded.SetMaxThreads.argtypes = [ctypes.c_int]
+            loaded.SetMaxThreads(0)
 
-        _dll.ErrorMessage.restype = None
-        _dll.ErrorMessage.argtypes = [ctypes.c_int, ctypes.c_char_p]
+            loaded.ErrorMessage.restype = None
+            loaded.ErrorMessage.argtypes = [ctypes.c_int, ctypes.c_char_p]
 
-        DDSS_AVAILABLE = True
-        print(f"Loaded ddss DLL from {_DLL_PATH}")
-        return True
-    except OSError as e:
-        print(f"Failed to load ddss DLL from {_DLL_PATH}: {e}. Falling back to endplay DDS.")
-        return False
+            _dll = loaded
+            _DLL_PATH = path
+            DDSS_AVAILABLE = True
+            print(f"Loaded ddss DLL from {path}")
+            return True
+        except OSError as e:
+            last_error = e
+    print(f"Failed to load ddss DLL: {last_error}. Falling back to endplay DDS.")
+    return False
 
 
 _load_dll()

@@ -488,7 +488,8 @@ class PostmortemBase(ABC):
         # PDF download button
         if hasattr(st.session_state, 'pdf_link') and st.session_state.pdf_link:
             try:
-                import streamlitlib
+                if streamlitlib is None:
+                    raise ImportError("streamlitlib is not available")
                 # Build PDF title with player name and license number
                 pdf_player_name = getattr(st.session_state, 'player_name', '')
                 pdf_player_license = getattr(st.session_state, 'player_license_number', '')

@@ -64,6 +64,17 @@ class PlayerSessionIndexTests(unittest.TestCase):
         }
         self.assertEqual(resolved, {"136662"})
 
+    def test_expand_player_aliases_includes_all_namespaces(self):
+        persons, _ = indexlib.build_index_frames(_ranking_results())
+        self.assertEqual(
+            indexlib.expand_player_aliases(persons, ["4958370"]),
+            ["4958370", "136662", "322582"],
+        )
+        self.assertEqual(
+            indexlib.expand_player_aliases(persons, ["unknown"]),
+            ["unknown"],
+        )
+
     def test_bare_numeric_collision_requires_explicit_namespace(self):
         persons, _ = indexlib.build_index_frames(_ranking_results())
         collision = pl.DataFrame(

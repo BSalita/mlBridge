@@ -11,7 +11,7 @@ import json
 import os
 import pathlib
 from datetime import datetime, timezone
-from typing import Any, Optional, Tuple
+from typing import Any, Optional, Sequence, Tuple
 
 import polars as pl
 
@@ -288,6 +288,37 @@ def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, 
             "use an explicit license:, classic:, or lancelot: prefix."
         )
     return matches.to_dicts()[0]
+
+
+def expand_player_aliases(
+    persons: pl.DataFrame,
+    tokens: Sequence[str],
+) -> list[str]:
+    """Expand each token to Lancelot, Classic/migration, and license IDs."""
+    expanded: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            expanded.append(text)
+
+    for token in tokens:
+        raw = str(token or "").strip()
+        if not raw:
+            continue
+        add(raw)
+        try:
+            person = lookup_person(persons, raw)
+        except ValueError:
+            continue
+        if person is None:
+            continue
+        add(person.get("lancelot_person_id"))
+        add(person.get("classic_person_id"))
+        add(person.get("license_number"))
+    return expanded
 
 
 def lookup_sessions(

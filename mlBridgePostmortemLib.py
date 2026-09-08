@@ -262,8 +262,6 @@ class PostmortemBase(ABC):
     
     def initialize_common_session_state(self):
         """Initialize common session state variables used across all applications."""
-        st.set_page_config(layout="wide")
-        
         # Platform-specific path handling
         if platform.system() == 'Windows':
             pathlib.PosixPath = pathlib.WindowsPath
@@ -588,6 +586,7 @@ class PostmortemBase(ABC):
     
     def main(self):
         """Main application entry point."""
+        st.set_page_config(layout="wide", initial_sidebar_state="expanded")
         if 'first_time' not in st.session_state:
             self.initialize_session_state()
             self.create_sidebar()

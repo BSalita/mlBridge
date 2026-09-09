@@ -104,6 +104,33 @@ class PlayerSessionIndexTests(unittest.TestCase):
             "322582",
         )
 
+    def test_lookup_persons_by_name_prefers_exact_last_name(self):
+        persons, _ = indexlib.build_index_frames(_ranking_results())
+        extra = pl.DataFrame(
+            {
+                "lancelot_person_id": ["246273", "244120"],
+                "classic_person_id": ["597539", "244120"],
+                "license_number": ["9500754", "1"],
+                "display_name": ["Robert SALITA", "Solita Duplan"],
+                "first_session_date": ["2025-01-01", "2025-01-01"],
+                "last_session_date": ["2026-09-07", "2026-01-01"],
+            }
+        )
+        persons = pl.concat([persons, extra], how="diagonal")
+
+        matches = indexlib.lookup_persons_by_name(persons, "SALITA")
+        self.assertEqual(
+            [row["lancelot_person_id"] for row in matches],
+            ["246273"],
+        )
+        self.assertEqual(
+            indexlib.lookup_persons_by_name(persons, "SALITA Robert")[0][
+                "lancelot_person_id"
+            ],
+            "246273",
+        )
+        self.assertEqual(indexlib.lookup_persons_by_name(persons, "Laumond")[0]["lancelot_person_id"], "136662")
+
     def test_round_trip_validates_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)

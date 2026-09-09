@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Optional, Sequence, Tuple
 
@@ -248,6 +249,60 @@ def normalize_identifier(value: Any) -> str:
     if normalized.isdigit():
         return normalized.lstrip("0") or "0"
     return normalized
+
+
+def normalize_person_name(value: Any) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return " ".join(
+        "".join(character for character in text if not unicodedata.combining(character))
+        .casefold()
+        .split()
+    )
+
+
+def _person_name_rank(
+    display_name: Any, query_tokens: Sequence[str]
+) -> Optional[tuple[int, int]]:
+    tokens = normalize_person_name(display_name).split()
+    if not tokens or not query_tokens:
+        return None
+    last = tokens[-1]
+    first = tokens[0]
+    if len(query_tokens) == 1:
+        token = query_tokens[0]
+        exact_last = int(last == token)
+        exact_first = int(first == token)
+        contained = int(token in tokens)
+        if not (exact_last or exact_first or contained):
+            return None
+        return (exact_last, exact_first or contained)
+    if not set(query_tokens) <= set(tokens):
+        return None
+    return (1, 1)
+
+
+def lookup_persons_by_name(
+    persons: pl.DataFrame,
+    query: str,
+    *,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Exact token match on display_name: last name, first name, or all tokens."""
+    needle = normalize_person_name(query)
+    if not needle:
+        raise ValueError("player name is required")
+    if "display_name" not in persons.columns:
+        raise ValueError("persons frame missing display_name")
+    query_tokens = needle.split()
+    limit = max(1, min(int(limit), 50))
+    ranked: list[tuple[tuple[int, int], str, dict[str, Any]]] = []
+    for row in persons.to_dicts():
+        rank = _person_name_rank(row.get("display_name"), query_tokens)
+        if rank is None:
+            continue
+        ranked.append((rank, str(row.get("last_session_date") or ""), row))
+    ranked.sort(key=lambda item: (item[0][0], item[0][1], item[1]), reverse=True)
+    return [item[2] for item in ranked[:limit]]
 
 
 def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, Any]]:

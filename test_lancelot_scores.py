@@ -1,5 +1,11 @@
 import unittest
 
+import polars as pl
+
+from mlBridge.mlBridgeAugmentLib import (
+    extract_declarer_from_contract,
+    normalize_contract_columns,
+)
 from mlBridge.mlBridgeFFLib import (
     _lancelot_contract_result,
     _lancelot_score_field_kind,
@@ -29,6 +35,31 @@ class LancelotScoreTests(unittest.TestCase):
         self.assertEqual(_lancelot_contract_result("+1"), 1)
         self.assertEqual(_lancelot_contract_result("-2"), -2)
         self.assertEqual(_lancelot_contract_result("="), 0)
+
+    def test_ouest_declarer_maps_to_west(self):
+        out = extract_declarer_from_contract(
+            pl.DataFrame({"Contract": ["1SO", "2HN", "PASS", "1SX"]})
+        )
+        self.assertEqual(out["Declarer_Direction"].to_list(), ["W", "N", None, None])
+
+    def test_normalize_contract_accepts_ouest_without_strict_replace(self):
+        out = normalize_contract_columns(
+            pl.DataFrame(
+                {
+                    "Contract": ["1SO", "PASS"],
+                    "Player_Name_N": ["A", "B"],
+                    "Player_Name_E": ["C", "D"],
+                    "Player_Name_S": ["E", "F"],
+                    "Player_Name_W": ["G", "H"],
+                    "Vul_NS": [True, False],
+                    "Vul_EW": [False, True],
+                }
+            )
+        )
+        self.assertEqual(out["Declarer_Direction"].to_list(), ["W", None])
+        self.assertEqual(out["LHO_Direction"].to_list(), ["N", None])
+        self.assertEqual(out["Dummy_Direction"].to_list(), ["E", None])
+        self.assertEqual(out["RHO_Direction"].to_list(), ["S", None])
 
 
 if __name__ == "__main__":

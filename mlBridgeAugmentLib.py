@@ -2281,10 +2281,18 @@ def extract_declarer_from_contract(df: pl.DataFrame) -> pl.DataFrame:
     Output columns:
     - 'Declarer_Direction': Single character direction (N/E/S/W) or None for PASS
     """
+    last = (
+        pl.col('Contract')
+        .str.slice(-1)
+        .replace_strict(
+            {'N': 'N', 'E': 'E', 'S': 'S', 'W': 'W', 'O': 'W'},
+            default=None,
+        )
+    )
     return df.with_columns(
         pl.when(pl.col('Contract').is_null() | (pl.col('Contract') == 'PASS'))
         .then(None)
-        .otherwise(pl.col('Contract').str.slice(-1))
+        .otherwise(last)
         .alias('Declarer_Direction')
     )
 
@@ -4934,9 +4942,9 @@ def normalize_contract_columns(df: pl.DataFrame) -> pl.DataFrame:
         'Dummy_Direction' not in df.columns and
         'RHO_Direction' not in df.columns):
         df = df.with_columns([
-            pl.col('Declarer_Direction').replace_strict(declarer_to_LHO_d).alias('LHO_Direction'),
-            pl.col('Declarer_Direction').replace_strict(declarer_to_dummy_d).alias('Dummy_Direction'),
-            pl.col('Declarer_Direction').replace_strict(declarer_to_RHO_d).alias('RHO_Direction'),
+            pl.col('Declarer_Direction').replace_strict(declarer_to_LHO_d, default=None).alias('LHO_Direction'),
+            pl.col('Declarer_Direction').replace_strict(declarer_to_dummy_d, default=None).alias('Dummy_Direction'),
+            pl.col('Declarer_Direction').replace_strict(declarer_to_RHO_d, default=None).alias('RHO_Direction'),
         ])
     return df
 

@@ -757,7 +757,7 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
                     pl.col('contract').str.slice(0,1), # level
                     pl.col('contract').str.replace('NT', 'N').str.slice(1,1), # strain
                     pl.col('contract').str.replace('NT', 'N').str.slice(2), # double
-                    pl.col('declarer'),
+                    pl.col('declarer').replace('O', 'W'),
                 ]))
             .when(pl.col('contract').str.to_uppercase().str.starts_with('PASS')) # e.g. 'PASS' or 'passe' or 'PASSE'
             .then(pl.lit('PASS'))

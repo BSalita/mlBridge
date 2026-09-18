@@ -284,17 +284,25 @@ def BoardNumberToVul(bn):
     return iVulToVul_d[BoardNumberToiVul(bn)]
 
 def PbnToN(bd):
+    """Rotate a PBN deal so the first hand is North.
+
+    Standard PBN lists hands clockwise from the prefix seat:
+    ``E:`` is East, South, West, North. The previous E/W recipes were
+    swapped and seated those deals 180 degrees off.
+    """
     hands = bd[2:].split(' ')
+    if len(hands) != 4:
+        raise ValueError(f"PBN must have 4 hands: {bd}")
     d = bd[0]
     match d:
         case 'N':
             pbn = bd
         case 'E':
-            pbn = 'N:'+' '.join([hands[1],hands[2],hands[3],hands[0]])
+            pbn = 'N:'+' '.join([hands[3],hands[0],hands[1],hands[2]])
         case 'S':
             pbn = 'N:'+' '.join([hands[2],hands[3],hands[0],hands[1]])
         case 'W':
-            pbn = 'N:'+' '.join([hands[3],hands[0],hands[1],hands[2]])
+            pbn = 'N:'+' '.join([hands[1],hands[2],hands[3],hands[0]])
         case _:
             raise ValueError(f"Invalid dealer: {d}")
     dpbn = Deal(pbn).to_pbn()

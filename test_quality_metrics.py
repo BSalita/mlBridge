@@ -4,6 +4,7 @@ import polars as pl
 
 from mlBridge.mlBridgeAugmentLib import (
     add_position_role_info,
+    compute_declarer_percentages,
     create_score_diff_columns,
 )
 
@@ -97,6 +98,24 @@ class QualityMetricTests(unittest.TestCase):
         result = create_score_diff_columns(df)
 
         self.assertEqual(result["DD_Tricks_Diff"].to_list(), [1, -1])
+
+    def test_mp_dd_pct_uses_declaring_side_dd_score_pct(self):
+        df = pl.DataFrame(
+            {
+                "Declarer_Pair_Direction": ["NS", "EW"],
+                "DD_Score_Pct_NS": [0.8, 0.2],
+                "DD_Score_Pct_EW": [0.2, 0.8],
+                "MP_Par_Declarer": [1.0, 1.0],
+                "MP_EV_Score_Declarer": [1.0, 1.0],
+                "MP_EV_Max_Declarer": [1.0, 1.0],
+                "MP_Top": [2.0, 2.0],
+            }
+        )
+
+        result = compute_declarer_percentages(df)
+
+        self.assertAlmostEqual(result["MP_DD_Pct_Declarer"][0], 0.8)
+        self.assertAlmostEqual(result["MP_DD_Pct_Declarer"][1], 0.8)
 
 
 if __name__ == "__main__":

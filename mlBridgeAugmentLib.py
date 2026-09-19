@@ -5990,14 +5990,15 @@ def compute_declarer_percentages(df: pl.DataFrame) -> pl.DataFrame:
     - df: DataFrame containing matchpoint score columns for declarer analysis
 
     Input columns:
-    - `MP_DD_Score_Declarer`: Raw matchpoints for double-dummy declarer score
-    - `MP_Par_Declarer`: Raw matchpoints for par score from declarer perspective  
+    - `DD_Score_Pct_NS`, `DD_Score_Pct_EW`: Matchpoints for DD tricks at the table contract
+    - `Declarer_Pair_Direction` or `Pair_Declarer_Direction`: Declaring side
+    - `MP_Par_Declarer`: Raw matchpoints for par score from declarer perspective
     - `MP_EV_Score_Declarer`: Raw matchpoints for expected value declarer score
     - `MP_EV_Max_Declarer`: Raw matchpoints for maximum expected value declarer score
     - `MP_Top`: Maximum possible matchpoints for percentage calculation
 
     Output columns:
-    - `MP_DD_Pct_Declarer`: Double-dummy score percentage (pl.Float32)
+    - `MP_DD_Pct_Declarer`: Matchpoint percentage for taking DD tricks at the table contract
     - `MP_Par_Pct_Declarer`: Par score percentage (pl.Float32)
     - `MP_EV_Pct_Declarer`: Expected value score percentage (pl.Float32)
     - `MP_EV_Max_Pct_Declarer`: Maximum expected value percentage (pl.Float32)
@@ -6005,8 +6006,29 @@ def compute_declarer_percentages(df: pl.DataFrame) -> pl.DataFrame:
     Returns:
     - DataFrame with added declarer percentage columns
     """
+    pair_col = (
+        'Declarer_Pair_Direction'
+        if 'Declarer_Pair_Direction' in df.columns
+        else 'Pair_Declarer_Direction'
+    )
+    if pair_col not in df.columns:
+        raise ValueError(
+            "Declarer_Pair_Direction or Pair_Declarer_Direction is required "
+            "for MP_DD_Pct_Declarer"
+        )
+    if 'DD_Score_Pct_NS' not in df.columns or 'DD_Score_Pct_EW' not in df.columns:
+        raise ValueError(
+            "DD_Score_Pct_NS and DD_Score_Pct_EW are required for "
+            "MP_DD_Pct_Declarer; run compute_dd_score_percentages first"
+        )
     return df.with_columns([
-        compute_mp_percentage_from_score('DD_Score_Declarer').alias('MP_DD_Pct_Declarer'),
+        pl.when(pl.col(pair_col) == 'NS')
+        .then(pl.col('DD_Score_Pct_NS'))
+        .when(pl.col(pair_col) == 'EW')
+        .then(pl.col('DD_Score_Pct_EW'))
+        .otherwise(None)
+        .cast(pl.Float32)
+        .alias('MP_DD_Pct_Declarer'),
         compute_mp_percentage_from_score('Par_Declarer').alias('MP_Par_Pct_Declarer'),
         compute_mp_percentage_from_score('EV_Score_Declarer').alias('MP_EV_Pct_Declarer'),
         compute_mp_percentage_from_score('EV_Max_Declarer').alias('MP_EV_Max_Pct_Declarer'),

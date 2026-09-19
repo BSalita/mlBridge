@@ -131,6 +131,32 @@ class PlayerSessionIndexTests(unittest.TestCase):
         )
         self.assertEqual(indexlib.lookup_persons_by_name(persons, "Laumond")[0]["lancelot_person_id"], "136662")
 
+    def test_licensed_player_with_visitor_partner_is_indexed(self):
+        results = pl.DataFrame(
+            {
+                "tournament_id": ["304735"],
+                "tournament_name": ["Festival"],
+                "date": ["2026-09-07"],
+                "series_id": [868],
+                "team_id": ["15223755"],
+                "club_id": ["5803081"],
+                "club_name": ["Bois Colombes"],
+                "player1_name": ["MADAR ."],
+                "player2_name": ["Juliette SYMCHOWICZ"],
+                "player1_lancelot_id": [None],
+                "player2_lancelot_id": ["100544"],
+                "player1_classic_person_id": [None],
+                "player2_classic_person_id": ["240070"],
+                "player1_license_number": [None],
+                "player2_license_number": ["2583335"],
+            }
+        )
+        persons, sessions = indexlib.build_index_frames(results)
+        person = indexlib.lookup_person(persons, "100544")
+        self.assertEqual(person["display_name"], "Juliette SYMCHOWICZ")
+        self.assertEqual(sessions["session_id"].to_list(), ["304735"])
+        self.assertEqual(persons.height, 1)
+
     def test_round_trip_validates_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = pathlib.Path(tmp)

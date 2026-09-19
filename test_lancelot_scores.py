@@ -10,6 +10,8 @@ from mlBridge.mlBridgeFFLib import (
     _lancelot_contract_result,
     _lancelot_score_field_kind,
     _lancelot_signed_ns_score,
+    lancelot_lineup_player_name_expr,
+    lancelot_seat_person,
 )
 
 
@@ -60,6 +62,27 @@ class LancelotScoreTests(unittest.TestCase):
         self.assertEqual(out["LHO_Direction"].to_list(), ["N", None])
         self.assertEqual(out["Dummy_Direction"].to_list(), ["E", None])
         self.assertEqual(out["RHO_Direction"].to_list(), ["S", None])
+
+    def test_visitor_name_string_is_kept_as_seat_person(self):
+        self.assertEqual(
+            lancelot_seat_person("MADAR ."),
+            {"firstName": "", "lastName": "MADAR ."},
+        )
+        frame = pl.DataFrame(
+            {
+                "lineup_northPlayer": ["MADAR ."],
+                "lineup_northPlayer_firstName": [None],
+                "lineup_northPlayer_lastName": [None],
+                "lineup_southPlayer_firstName": ["Juliette"],
+                "lineup_southPlayer_lastName": ["SYMCHOWICZ"],
+            }
+        )
+        out = frame.select(
+            lancelot_lineup_player_name_expr(frame, "lineup_northPlayer").alias("N"),
+            lancelot_lineup_player_name_expr(frame, "lineup_southPlayer").alias("S"),
+        )
+        self.assertEqual(out["N"][0], "MADAR .")
+        self.assertEqual(out["S"][0], "Juliette SYMCHOWICZ")
 
 
 if __name__ == "__main__":

@@ -70,6 +70,60 @@ def lancelot_api_url(path: str) -> str:
     return f"{LANCELOT_API_BASE}/{path.lstrip('/')}"
 
 
+def lancelot_seat_person(value: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a ranking/lineup seat: licensed person object or visitor name string."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        return {"firstName": "", "lastName": value.strip()}
+    return None
+
+
+def lancelot_player_display_name(person: Optional[Dict[str, Any]]) -> str:
+    if not person:
+        return ""
+    return " ".join(
+        part
+        for part in (
+            str(person.get("firstName") or "").strip(),
+            str(person.get("lastName") or "").strip(),
+        )
+        if part
+    )
+
+
+def lancelot_lineup_player_name_expr(frame: pl.DataFrame, prefix: str) -> pl.Expr:
+    """Prefer licensed first+last; fall back to a visitor name-string column."""
+    columns = set(frame.columns)
+    first_name = f"{prefix}_firstName"
+    last_name = f"{prefix}_lastName"
+    licensed = None
+    if first_name in columns or last_name in columns:
+        first = (
+            pl.col(first_name).cast(pl.String, strict=False).fill_null("")
+            if first_name in columns
+            else pl.lit("")
+        )
+        last = (
+            pl.col(last_name).cast(pl.String, strict=False).fill_null("")
+            if last_name in columns
+            else pl.lit("")
+        )
+        combined = (first + pl.lit(" ") + last).str.strip_chars()
+        licensed = pl.when(combined == "").then(None).otherwise(combined)
+    visitor = None
+    if prefix in columns and frame.schema.get(prefix) == pl.String:
+        raw = pl.col(prefix).cast(pl.String, strict=False).fill_null("").str.strip_chars()
+        visitor = pl.when(raw == "").then(None).otherwise(raw)
+    if licensed is not None and visitor is not None:
+        return pl.coalesce(licensed, visitor)
+    if licensed is not None:
+        return licensed
+    if visitor is not None:
+        return visitor
+    return pl.lit(None)
+
+
 def normalize_club_code(code: Any) -> str:
     """Normalize club codes (e.g. Lancelot simultaneousId) by stripping leading zeros."""
     if code is None:
@@ -792,10 +846,10 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
         # pl.col('team_player2_ffbId').alias('player2_id'),
         # pl.col('team_player2_firstName').alias('player2_firstName'),
         # pl.col('team_player2_lastName').alias('player2_lastName'),
-        (pl.col('lineup_northPlayer_firstName')+pl.lit(' ')+pl.col('lineup_northPlayer_lastName')).alias('Player_Name_N'),
-        (pl.col('lineup_eastPlayer_firstName')+pl.lit(' ')+pl.col('lineup_eastPlayer_lastName')).alias('Player_Name_E'),
-        (pl.col('lineup_southPlayer_firstName')+pl.lit(' ')+pl.col('lineup_southPlayer_lastName')).alias('Player_Name_S'),
-        (pl.col('lineup_westPlayer_firstName')+pl.lit(' ')+pl.col('lineup_westPlayer_lastName')).alias('Player_Name_W'),
+        lancelot_lineup_player_name_expr(ffdf, 'lineup_northPlayer').alias('Player_Name_N'),
+        lancelot_lineup_player_name_expr(ffdf, 'lineup_eastPlayer').alias('Player_Name_E'),
+        lancelot_lineup_player_name_expr(ffdf, 'lineup_southPlayer').alias('Player_Name_S'),
+        lancelot_lineup_player_name_expr(ffdf, 'lineup_westPlayer').alias('Player_Name_W'),
         # Lancelot person ids (the scores endpoint no longer returns ffbId per lineup player).
         # Cast through Int64 because pandas normalization makes these float when nulls exist (sitouts).
         pl.col('lineup_northPlayer_id').cast(pl.Int64, strict=False).cast(pl.String).alias('lineup_northPlayer_id'),

@@ -4,6 +4,7 @@ Contains standard code shared between different bridge applications.
 """
 
 from abc import ABC, abstractmethod
+import inspect
 import logging
 import os
 import polars as pl
@@ -12,6 +13,7 @@ import streamlit_chat
 from streamlit_extras.bottom_container import bottom
 from stqdm import stqdm
 import pathlib
+import subprocess
 import duckdb
 import json
 import platform
@@ -20,6 +22,46 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Union
 
 from mlBridge.mlBridgeLib import cast_numeric_display_columns
+
+
+def git_build_stamp(path: pathlib.Path) -> str:
+    """Git commit time of path, not Docker/checkout mtime."""
+    path = pathlib.Path(path).resolve()
+    try:
+        raw = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(path.parent),
+                "log",
+                "-1",
+                "--format=%cI %h",
+                "--",
+                path.name,
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        raw = ""
+    if raw:
+        iso, _, sha = raw.rpartition(" ")
+        try:
+            when = datetime.fromisoformat(iso).astimezone(timezone.utc)
+            return f"{when.strftime('%Y-%m-%d %H:%M:%S %Z')} {sha}"
+        except ValueError:
+            return raw
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S %Z"
+    )
+
+
+def _caller_source_path() -> pathlib.Path:
+    frame = inspect.currentframe()
+    previous = frame.f_back if frame is not None else None
+    previous = previous.f_back if previous is not None else None
+    source = previous.f_globals.get("__file__") if previous is not None else None
+    return pathlib.Path(source or __file__)
 
 try:
     import streamlitlib
@@ -278,7 +320,7 @@ class PostmortemBase(ABC):
             'do_not_cache_df': True,
             'con_register_name': 'self',
             'main_section_container': st.empty(),
-            'app_datetime': datetime.fromtimestamp(pathlib.Path(__file__).stat().st_mtime, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S %Z'),
+            'app_datetime': git_build_stamp(_caller_source_path()),
             'current_datetime': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             'sql_query_mode': False,
             'sql_queries': [],

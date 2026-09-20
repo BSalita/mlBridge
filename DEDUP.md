@@ -14,7 +14,13 @@ entry point. All imports are package-style:
 ```python
 from mlBridge.mlBridgeAugmentLib import AllAugmentations
 from mlBridge import mlBridgeFFLib
+from mlBridge import mlBridgeApiCommon
 ```
+
+`mlBridgeApiCommon` holds FastAPI health, DuckDB SQL-over-parquet, and
+favorites helpers. Domain handlers stay in each product repo. BridgeStats
+images do not clone mlBridge, so those repos vendor the same file as
+`bridge_api_common.py`.
 
 Never put THIS directory itself on `sys.path` and never use flat imports
 (`import mlBridgeFFLib`). The package `__init__` is lazy (PEP 562), so package

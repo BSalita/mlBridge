@@ -830,6 +830,11 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
         pl.col('result')
             .map_elements(_lancelot_contract_result, return_dtype=pl.Int16)
             .alias('Result'),
+        (
+            pl.col('lead').cast(pl.Utf8)
+            if 'lead' in ffdf.columns
+            else pl.lit(None).cast(pl.Utf8)
+        ).alias('Lead'),
         # Populated nsScore/ewScore = side that received positive trick points (not notes).
         pl.struct(['nsScore', 'ewScore'])
             .map_elements(

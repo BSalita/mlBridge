@@ -1439,7 +1439,6 @@ def acbldf_to_mldf(df: pl.DataFrame) -> pl.DataFrame:
 # ============================================================================
 
 # Constants for Playwright browser configuration
-ACBL_PAGE_LOAD_TIMEOUT = 60000  # milliseconds
 ACBL_VIEWPORT_WIDTH = 1920
 ACBL_VIEWPORT_HEIGHT = 1080
 ACBL_USER_AGENT = (
@@ -1474,7 +1473,7 @@ if (navigator.plugins.length === 0) {
 # user-data-dir can: a human solves the checkbox ONCE (see
 # acbl_solve_challenge.py) and the resulting cf_clearance cookie (observed
 # lifetime: 1 year) lets all later automated runs through. The Chrome window
-# is pushed off-screen so it never bothers the user.
+# stays on-screen so Turnstile can finish.
 #
 # The profile directory is resolved from the ACBL_BROWSER_PROFILE_DIR env var,
 # else from known default locations. If no profile exists (or launching real
@@ -1486,9 +1485,6 @@ ACBL_DEFAULT_PROFILE_DIRS = (
     pathlib.Path('e:/bridge/data/acbl/playwright_profile'),  # shared with acbl_club_download_to_json.py
     pathlib.Path('playwright_profile'),
 )
-_OFFSCREEN_WINDOW_POS = '-32000,-32000'
-
-
 def resolve_acbl_browser_profile_dir():
     """
     Return the persistent Chrome profile directory to use, or None if none is
@@ -1507,7 +1503,7 @@ def create_acbl_browser_context(p, headless=True):
     """
     Helper to create browser context with consistent settings for ACBL scraping.
 
-    Preferred path: persistent real-Chrome context (headed, off-screen window)
+    Preferred path: persistent real-Chrome context (headed, on-screen window)
     whose profile carries the cf_clearance cookie that clears Cloudflare's
     Turnstile challenge. Falls back to stealth-hardened headless Chromium when
     no profile is configured or real Chrome cannot launch.
@@ -1535,12 +1531,8 @@ def create_acbl_browser_context(p, headless=True):
                     '--disable-blink-features=AutomationControlled',
                     '--no-first-run',
                     '--no-default-browser-check',
-                    # Off-screen only on a real Windows desktop, where the headed
-                    # window would pop over the user. Under Xvfb in containers
-                    # there is no user to annoy, and screenX=-32000 is a bot
-                    # signal to Cloudflare Turnstile.
-                    *([f'--window-position={_OFFSCREEN_WINDOW_POS}'] if os.name == 'nt'
-                      else ['--window-position=0,0']),
+                    # On-screen. An off-screen window never completes Turnstile.
+                    '--window-position=80,80',
                     f'--window-size={ACBL_VIEWPORT_WIDTH},{ACBL_VIEWPORT_HEIGHT}',
                     # Chrome refuses to run as root (typical in containers)
                     # with its sandbox enabled.
@@ -1565,100 +1557,64 @@ def create_acbl_browser_context(p, headless=True):
     return browser, context
 
 
-# Markers that identify a Cloudflare challenge/interstitial page.
-_CLOUDFLARE_CHALLENGE_MARKERS = (
-    'just a moment',
-    'checking your browser',
-    'challenge-platform',
-    '_cf_chl_opt',
-    'cf-challenge',
-    'cf_chl_',
-    'turnstile',
-    'cloudflare',
-)
+def _pipeline_challenge_api():
+    """Load the club-download Cloudflare waiter. Same profile, same rules."""
+    pipeline = pathlib.Path(__file__).resolve().parents[1] / "acbl-pipeline"
+    if pipeline.is_dir() and str(pipeline) not in sys.path:
+        sys.path.insert(0, str(pipeline))
+    from acbl_club_download_to_json import (
+        Forbidden403Error,
+        _transient_navigation_error,
+        _wait_through_cloudflare,
+    )
+    return Forbidden403Error, _transient_navigation_error, _wait_through_cloudflare
 
-# Where timeout diagnostics (HTML + screenshot) are written.
-ACBL_DIAGNOSTICS_DIR = pathlib.Path('playwright_diagnostics')
+
+def wait_through_acbl_challenge(page, timeout_ms=None):
+    """Wait out Cloudflare the way the result downloaders do.
+
+    On-screen Chrome, refresh every 30 seconds, up to six hours. A leftover
+    Turnstile script on a page that already has the real payload is not a
+    challenge.
+    """
+    _, _, wait = _pipeline_challenge_api()
+    if timeout_ms is None:
+        return wait(page)
+    return wait(page, timeout_ms=timeout_ms)
 
 
 def _goto_with_diagnostics(page, url, verbose=True):
+    """Open url and stay until Cloudflare clears.
+
+    Uses domcontentloaded, then the shared waiter from
+    acbl_club_download_to_json. A transient navigation error (ERR_ABORTED and
+    the like) retries up to three times on the same page. The document status
+    is not treated as failure: the challenge response is often 403 before the
+    real page arrives, and the waiter returns only after the payload is there.
+
+    The function name is unchanged so existing callers keep working.
     """
-    Navigate with page.goto(wait_until='networkidle') and, on timeout, capture
-    diagnostics (page HTML + screenshot) and re-raise with a verdict on whether
-    a Cloudflare challenge page is responsible.
-
-    A Cloudflare managed challenge keeps polling its challenge-platform
-    endpoints, so 'networkidle' is never reached and goto raises TimeoutError
-    without an HTTP status. Capturing the page content at that moment tells us
-    definitively whether we're stuck on a challenge or the page is just chatty.
-
-    Args:
-        page: Playwright page object
-        url: URL to navigate to
-        verbose: Print progress messages
-
-    Returns:
-        Playwright Response object (same as page.goto)
-
-    Raises:
-        RuntimeError: On navigation timeout, with diagnosis and paths to saved artifacts.
-    """
-    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-
-    try:
-        return page.goto(url, wait_until='networkidle', timeout=ACBL_PAGE_LOAD_TIMEOUT)
-    except PlaywrightTimeoutError as e:
-        # The page object is still alive after a goto timeout; capture what loaded.
-        html_content = None
-        html_path = None
-        screenshot_path = None
-        timestamp = time.strftime('%Y%m%d_%H%M%S')
+    Forbidden403Error, is_transient, wait = _pipeline_challenge_api()
+    last_error = None
+    for attempt in range(1, 4):
         try:
-            ACBL_DIAGNOSTICS_DIR.mkdir(parents=True, exist_ok=True)
-            try:
-                html_content = page.content()
-                html_path = ACBL_DIAGNOSTICS_DIR / f'goto_timeout_{timestamp}.html'
-                html_path.write_text(html_content, encoding='utf-8')
-            except Exception as capture_err:
-                print_to_log_info(f'Could not capture page HTML after timeout: {capture_err}')
-            try:
-                screenshot_path = ACBL_DIAGNOSTICS_DIR / f'goto_timeout_{timestamp}.png'
-                page.screenshot(path=str(screenshot_path))
-            except Exception as capture_err:
-                screenshot_path = None
-                print_to_log_info(f'Could not capture screenshot after timeout: {capture_err}')
-        except Exception as diag_err:
-            print_to_log_info(f'Could not write timeout diagnostics: {diag_err}')
-
-        if html_content:
-            html_lower = html_content.lower()
-            matched = [m for m in _CLOUDFLARE_CHALLENGE_MARKERS if m in html_lower]
-            if matched:
-                verdict = (
-                    f"Cloudflare challenge detected (markers: {', '.join(matched)}). "
-                    "The site is blocking this automated browser. Fix: run "
-                    "'python acbl_solve_challenge.py' once on this machine to solve the "
-                    "challenge manually and warm the persistent Chrome profile "
-                    f"(configure its location with the {ACBL_PROFILE_DIR_ENV} env var)."
-                )
-            else:
-                verdict = (
-                    "No Cloudflare challenge markers found in the loaded HTML. "
-                    "The page likely has ongoing network activity (analytics/polling) "
-                    "that prevents 'networkidle' from being reached."
-                )
-        else:
-            verdict = "Page content could not be captured, so the cause is undetermined."
-
-        artifacts = ', '.join(str(p_) for p_ in (html_path, screenshot_path) if p_ is not None) or 'none'
-        message = (
-            f"Timed out ({ACBL_PAGE_LOAD_TIMEOUT/1000:.0f}s) loading {url}. "
-            f"{verdict} Diagnostics saved: {artifacts}"
-        )
-        if verbose:
-            print(f"  {message}")
-        print_to_log_info(message)
-        raise RuntimeError(message) from e
+            response = page.goto(url, wait_until="domcontentloaded", timeout=90000)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= 3 or not is_transient(exc):
+                raise
+            if verbose:
+                print(f"  navigation to {url} failed ({exc}); retrying ({attempt}/3)")
+            time.sleep(2 * attempt)
+            continue
+        try:
+            wait(page)
+        except Forbidden403Error:
+            raise
+        return response
+    if last_error is not None:
+        raise last_error
+    return None
 
 
 def _run_in_thread_with_new_loop(func, *args, **kwargs):
@@ -1717,11 +1673,8 @@ def _get_club_results_sync(acbl_number, headless=True, save_screenshot=None, lim
             # Navigate to the page
             if verbose:
                 print("  Loading page...")
-            response = _goto_with_diagnostics(page, url, verbose=verbose)
-            
-            if response.status != 200:
-                raise Exception(f"Failed to load page. Status code: {response.status}")
-            
+            _goto_with_diagnostics(page, url, verbose=verbose)
+
             # Take screenshot if requested
             if save_screenshot:
                 page.screenshot(path=save_screenshot)
@@ -1782,12 +1735,15 @@ def _get_club_results_sync(acbl_number, headless=True, save_screenshot=None, lim
                             if verbose:
                                 print(f"    Found Next button with selector: {selector}")
                             next_button.click()
-                            page.wait_for_load_state('networkidle', timeout=ACBL_PAGE_LOAD_TIMEOUT)
+                            page.wait_for_load_state('domcontentloaded', timeout=90000)
+                            wait_through_acbl_challenge(page)
                             page_num += 1
                             time.sleep(0.5)  # Small delay to be respectful
                             next_button_found = True
                             break
                     except Exception as e:
+                        if type(e).__name__ == "Forbidden403Error":
+                            raise
                         # Try next selector
                         if verbose:
                             print(f"    Selector {selector} failed: {e}")
@@ -1948,11 +1904,8 @@ def _get_club_results_details_sync(url, headless=True, verbose=True):
         page = context.new_page()
         
         try:
-            response = _goto_with_diagnostics(page, url, verbose=verbose)
-            
-            if response.status != 200:
-                raise Exception(f"Failed to load page. Status code: {response.status}")
-            
+            _goto_with_diagnostics(page, url, verbose=verbose)
+
             # Get page content immediately - no need to wait for specific components
             # since we have reliable extraction methods that work with the raw HTML
             html_content = page.content()

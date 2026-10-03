@@ -54,6 +54,7 @@ LANCELOT_TO_MIGRATION = {
     17: 140,  # Amour du Bridge
     25: 384,  # Simultanet
     27: 386,  # Simultané Octopus
+    45: 499,  # Simultané du Comité du Val de Seine
     47: 604,  # Atout Simultané
     62: 868,  # Festival des Simultanés
 }

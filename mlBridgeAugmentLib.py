@@ -5164,6 +5164,21 @@ def add_best_contract_ev(df: pl.DataFrame) -> pl.DataFrame:
     return out
 
 
+def player_id_for_direction(direction_column: str) -> pl.Expr:
+    """Player id sitting in a N/E/S/W direction, as text.
+
+    Club ids are integers. Tournament ids include temporary numbers such as #155.
+    """
+    selected = pl.lit(None, dtype=pl.String)
+    for seat in "NESW":
+        selected = (
+            pl.when(pl.col(direction_column).eq(seat))
+            .then(pl.col(f"Player_ID_{seat}").cast(pl.String, strict=False))
+            .otherwise(selected)
+        )
+    return selected
+
+
 def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
     """Create declarer/opponent/lead position columns and board-quality fields.
 
@@ -5217,9 +5232,7 @@ def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
     """
     return (
         df.with_columns([
-            pl.struct(['Declarer_Direction', 'Player_ID_N', 'Player_ID_E', 'Player_ID_S', 'Player_ID_W']).map_elements(
-                lambda r: None if r['Declarer_Direction'] is None else r[f"Player_ID_{r['Declarer_Direction']}"] , return_dtype=pl.String
-            ).alias('Declarer')
+            player_id_for_direction('Declarer_Direction').alias('Declarer')
         ])
         .with_columns([
             pl.col('Declarer_Direction').replace_strict(NextPosition).alias('Direction_OnLead'),
@@ -5278,21 +5291,15 @@ def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
         .with_columns([
             pl.col('Declarer_Pair_Direction').replace_strict(PairDirectionToOpponentPairDirection).alias('Defender_Pair_Direction'),
             pl.col('Direction_OnLead').replace_strict(NextPosition).alias('Direction_Dummy'),
-            pl.struct(['Direction_OnLead', 'Player_ID_N', 'Player_ID_E', 'Player_ID_S', 'Player_ID_W']).map_elements(
-                lambda r: None if r['Direction_OnLead'] is None else r[f"Player_ID_{r['Direction_OnLead']}"] , return_dtype=pl.String
-            ).alias('OnLead'),
+            player_id_for_direction('Direction_OnLead').alias('OnLead'),
         ])
         .with_columns([
             pl.col('Direction_Dummy').replace_strict(NextPosition).alias('Direction_NotOnLead'),
-            pl.struct(['Direction_Dummy', 'Player_ID_N', 'Player_ID_E', 'Player_ID_S', 'Player_ID_W']).map_elements(
-                lambda r: None if r['Direction_Dummy'] is None else r[f"Player_ID_{r['Direction_Dummy']}"] , return_dtype=pl.String
-            ).alias('Dummy'),
+            player_id_for_direction('Direction_Dummy').alias('Dummy'),
             pl.col('Score_Declarer').le(pl.col('Par_Declarer')).alias('Defender_Par_GE')
         ])
         .with_columns([
-            pl.struct(['Direction_NotOnLead', 'Player_ID_N', 'Player_ID_E', 'Player_ID_S', 'Player_ID_W']).map_elements(
-                lambda r: None if r['Direction_NotOnLead'] is None else r[f"Player_ID_{r['Direction_NotOnLead']}"] , return_dtype=pl.String
-            ).alias('NotOnLead')
+            player_id_for_direction('Direction_NotOnLead').alias('NotOnLead')
         ])
     )
 def add_trick_probabilities(df: pl.DataFrame) -> pl.DataFrame:

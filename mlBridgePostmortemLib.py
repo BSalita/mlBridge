@@ -483,8 +483,12 @@ class PostmortemBase(ABC):
             
             # Generate report sections from favorites
             try:
-                st.session_state.button_title = 'Summarize'
-                selected_button = st.session_state.favorites['Buttons'][st.session_state.button_title]
+                buttons = st.session_state.favorites['Buttons']
+                button_key = st.session_state.get('button_title') or 'Summarize'
+                if button_key not in buttons:
+                    button_key = 'Summarize'
+                st.session_state.button_title = button_key
+                selected_button = buttons[button_key]
                 vetted_prompts = st.session_state.favorites['SelectBoxes']['Vetted_Prompts']
                 sql_query_count = 0
                 

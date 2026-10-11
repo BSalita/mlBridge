@@ -964,6 +964,47 @@ def df_to_float32_matrix(
     return out
 
 
+def polars_dtype_from_str(dtype_str: str) -> Any:
+    """Rebuild a Polars dtype from its str() form, as written into model schemas.
+
+    Handles bare names ("Float32", "Utf8") and parameterized forms such as
+    "Datetime(time_unit='us', time_zone=None)", "Enum(categories=['N', 'E'])",
+    "List(Int32)", "Array(Float32, shape=(3,))", "Decimal(precision=10, scale=2)"
+    and "Struct({'a': Int64})". Only Polars dtype names and literals are accepted.
+    """
+    import ast
+
+    def dtype_class(name: str) -> Any:
+        obj = getattr(pl, name, None)
+        if isinstance(obj, type) and (issubclass(obj, pl.DataType) or obj is pl.Field):
+            return obj
+        raise ValueError(f"Unknown Polars dtype {name!r} in {dtype_str!r}")
+
+    def build(node: ast.AST) -> Any:
+        if isinstance(node, ast.Name):
+            return dtype_class(node.id)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            cls = dtype_class(node.func.id)
+            args = [build(a) for a in node.args]
+            kwargs = {kw.arg: build(kw.value) for kw in node.keywords}
+            return cls(*args, **kwargs)
+        if isinstance(node, ast.Dict):
+            return {ast.literal_eval(k): build(v) for k, v in zip(node.keys, node.values)}
+        if isinstance(node, ast.List):
+            return [build(e) for e in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(build(e) for e in node.elts)
+        if isinstance(node, ast.Constant):
+            return node.value
+        raise ValueError(f"Unsupported syntax in dtype string {dtype_str!r}")
+
+    try:
+        tree = ast.parse(str(dtype_str).strip(), mode='eval')
+    except SyntaxError as exc:
+        raise ValueError(f"Cannot parse dtype string {dtype_str!r}") from exc
+    return build(tree.body)
+
+
 def validate_dataframe_dtypes(
     df: pl.DataFrame,
     expected_dtypes: Dict[str, str],
@@ -1053,7 +1094,7 @@ def validate_dataframe_dtypes(
         if len(widening_casts) > 8:
             preview += f", ... ({len(widening_casts)} total)"
         print(f"🔧 {context}: auto-widening column dtypes to match schema (lossless): {preview}")
-        df = df.with_columns([pl.col(c).cast(getattr(pl, e)) for c, e, _ in widening_casts])
+        df = df.with_columns([pl.col(c).cast(polars_dtype_from_str(e)) for c, e, _ in widening_casts])
 
     if mismatches:
         error_msg = f"Dtype mismatches in {context}:\n" + "\n".join(mismatches)
@@ -1068,35 +1109,11 @@ def validate_dataframe_dtypes(
             df_converted = df
             for col, expected_dtype_str, actual_dtype_str in conversions_needed:
                 try:
-                    # Map string dtype names to Polars dtypes
-                    dtype_map = {
-                        'Float32': pl.Float32,
-                        'Float64': pl.Float64,
-                        'Int8': pl.Int8,
-                        'Int16': pl.Int16,
-                        'Int32': pl.Int32,
-                        'Int64': pl.Int64,
-                        'UInt8': pl.UInt8,
-                        'UInt16': pl.UInt16,
-                        'UInt32': pl.UInt32,
-                        'UInt64': pl.UInt64,
-                        'Boolean': pl.Boolean,
-                        'String': pl.String,
-                        'Utf8': pl.Utf8,
-                        'Categorical': pl.Categorical,
-                        'Date': pl.Date,
-                        'Datetime': pl.Datetime,
-                    }
-                    
-                    target_dtype = dtype_map.get(expected_dtype_str)
-                    if target_dtype:
-                        df_converted = df_converted.with_columns(
-                            pl.col(col).cast(target_dtype)
-                        )
-                        print(f"  ✅ Converted {col}: {actual_dtype_str} → {expected_dtype_str}")
-                    else:
-                        print(f"  ❌ Unknown target dtype {expected_dtype_str} for {col}")
-                        
+                    target_dtype = polars_dtype_from_str(expected_dtype_str)
+                    df_converted = df_converted.with_columns(
+                        pl.col(col).cast(target_dtype)
+                    )
+                    print(f"  ✅ Converted {col}: {actual_dtype_str} → {expected_dtype_str}")
                 except Exception as e:
                     print(f"  ❌ Failed to convert {col}: {e}")
                     if strict:

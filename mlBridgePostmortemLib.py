@@ -68,6 +68,21 @@ try:
 except ImportError:
     streamlitlib = None
 
+def standard_report_title() -> str:
+    """Report heading. Organizer-only sessions are marked provisional."""
+    title = "Bridge Game Postmortem Report"
+    if st.session_state.get("provisional_results"):
+        title = f"Provisional Results: {title}"
+    player_name = st.session_state.get("player_name")
+    if player_name:
+        player_license = st.session_state.get("player_license_number") or ""
+        if player_license:
+            title += f" Personalized for {player_name} ({player_license})"
+        else:
+            title += f" Personalized for {player_name}"
+    return title
+
+
 # todo: shouldn't other methods be abstract and initialized in main()?
 class PostmortemBase(ABC):
     """Base class containing standard mlBridge code shared across applications."""
@@ -407,13 +422,7 @@ class PostmortemBase(ABC):
         st.session_state.main_section_container = st.container(border=True)
         with st.session_state.main_section_container:
             # Report header information
-            report_title = f"Bridge Game Postmortem Report"
-            if hasattr(st.session_state, 'player_name') and st.session_state.player_name:
-                player_license = getattr(st.session_state, 'player_license_number', '')
-                if player_license:
-                    report_title += f" Personalized for {st.session_state.player_name} ({player_license})"
-                else:
-                    report_title += f" Personalized for {st.session_state.player_name}"
+            report_title = standard_report_title()
             
             report_creator = f"Created by https://{getattr(st.session_state, 'game_name', 'bridge')}.postmortem.chat"
             

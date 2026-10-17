@@ -19,7 +19,7 @@ import json
 import platform
 import sys
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Any, Union
+from typing import Dict, List, Mapping, Optional, Any, Union
 
 from mlBridge.mlBridgeLib import cast_numeric_display_columns
 from mlBridge.postmortem_section_help import section_help_for_players
@@ -69,18 +69,72 @@ try:
 except ImportError:
     streamlitlib = None
 
+def language_from_accept_language(header: str | None) -> str:
+    """Primary browser language. French tags stay French; everything else is English."""
+    if not header:
+        return "en"
+    tag = header.split(",", 1)[0].split(";", 1)[0].strip().lower().replace("_", "-")
+    if tag == "fr" or tag.startswith("fr-"):
+        return "fr"
+    return "en"
+
+
+def report_language() -> str:
+    """Language chosen for this report. Unset stays English."""
+    try:
+        language = st.session_state.get("report_language")
+    except Exception:
+        return "en"
+    language = str(language or "en").strip().lower()
+    return language if language in ("en", "fr") else "en"
+
+
+def localized_field(entry: Any, field: str, default: str = "") -> str:
+    """English field on the favorite, or i18n[language][field] when that text exists."""
+    language = report_language()
+    if isinstance(entry, Mapping) and language != "en":
+        i18n = entry.get("i18n")
+        if isinstance(i18n, Mapping):
+            block = i18n.get(language)
+            if isinstance(block, Mapping):
+                text = block.get(field)
+                if isinstance(text, str) and text.strip():
+                    return text
+    if isinstance(entry, Mapping):
+        text = entry.get(field)
+        if isinstance(text, str) and text.strip():
+            return text
+    return default
+
+
+def chrome_text(key: str, default: str) -> str:
+    """Report chrome from favorites['Chrome'], falling back to the English default."""
+    try:
+        favorites = st.session_state.get("favorites")
+    except Exception:
+        favorites = None
+    block = favorites.get("Chrome") if isinstance(favorites, Mapping) else None
+    if isinstance(block, Mapping):
+        return localized_field(block, key, default)
+    return default
+
+
 def standard_report_title() -> str:
     """Report heading. Organizer-only sessions are marked provisional."""
-    title = "Bridge Game Postmortem Report"
+    title = chrome_text("report_title", "Bridge Game Postmortem Report")
     if st.session_state.get("provisional_results"):
-        title = f"Provisional Results: {title}"
+        title = chrome_text("provisional_prefix", "Provisional Results: {title}").format(title=title)
     player_name = st.session_state.get("player_name")
     if player_name:
         player_license = st.session_state.get("player_license_number") or ""
         if player_license:
-            title += f" Personalized for {player_name} ({player_license})"
+            phrase = chrome_text(
+                "personalized_for_license",
+                "Personalized for {name} ({license})",
+            ).format(name=player_name, license=player_license)
         else:
-            title += f" Personalized for {player_name}"
+            phrase = chrome_text("personalized_for", "Personalized for {name}").format(name=player_name)
+        title += f" {phrase}"
     return title
 
 
@@ -268,7 +322,7 @@ class PostmortemBase(ABC):
 
         # Load default favorites
         if st.session_state.default_favorites_file.exists():
-            with open(st.session_state.default_favorites_file, 'r') as f:
+            with open(st.session_state.default_favorites_file, 'r', encoding='utf-8') as f:
                 favorites = json.load(f)
             st.session_state.favorites = favorites
         else:
@@ -276,7 +330,7 @@ class PostmortemBase(ABC):
 
         # Load player-specific favorites
         if st.session_state.player_id_custom_favorites_file.exists():
-            with open(st.session_state.player_id_custom_favorites_file, 'r') as f:
+            with open(st.session_state.player_id_custom_favorites_file, 'r', encoding='utf-8') as f:
                 player_id_favorites = json.load(f)
             st.session_state.player_id_favorites = player_id_favorites
         else:
@@ -284,7 +338,7 @@ class PostmortemBase(ABC):
 
         # Load debug favorites
         if st.session_state.debug_favorites_file.exists():
-            with open(st.session_state.debug_favorites_file, 'r') as f:
+            with open(st.session_state.debug_favorites_file, 'r', encoding='utf-8') as f:
                 debug_favorites = json.load(f)
             st.session_state.debug_favorites = debug_favorites
         else:
@@ -417,7 +471,10 @@ class PostmortemBase(ABC):
     def write_standard_report(self):
         """Generate standard postmortem report using favorites configuration."""
         if not st.session_state.favorites:
-            st.error("No favorites configuration found. Cannot generate report.")
+            st.error(chrome_text(
+                "no_favorites",
+                "No favorites configuration found. Cannot generate report.",
+            ))
             return
             
         st.session_state.main_section_container = st.container(border=True)
@@ -425,7 +482,9 @@ class PostmortemBase(ABC):
             # Report header information
             report_title = standard_report_title()
             
-            report_creator = f"Created by https://{getattr(st.session_state, 'game_name', 'bridge')}.postmortem.chat"
+            report_creator = chrome_text("created_by", "Created by {url}").format(
+                url=f"https://{getattr(st.session_state, 'game_name', 'bridge')}.postmortem.chat"
+            )
             
             # Event information
             event_info_parts = []
@@ -434,35 +493,70 @@ class PostmortemBase(ABC):
             if hasattr(st.session_state, 'game_description') and st.session_state.game_description:
                 event_info_parts.append(st.session_state.game_description)
             if hasattr(st.session_state, 'tournament_date') and st.session_state.tournament_date:
-                event_info_parts.append(f"on {st.session_state.tournament_date}")
+                event_info_parts.append(
+                    chrome_text("on_date", "on {date}").format(date=st.session_state.tournament_date)
+                )
             if hasattr(st.session_state, 'session_id') and st.session_state.session_id:
-                event_info_parts.append(f"(event id {st.session_state.session_id})")
+                event_info_parts.append(
+                    chrome_text("event_id", "(event id {session_id})").format(
+                        session_id=st.session_state.session_id
+                    )
+                )
             
-            report_event_info = " ".join(event_info_parts) if event_info_parts else "Bridge Game"
+            report_event_info = " ".join(event_info_parts) if event_info_parts else chrome_text(
+                "bridge_game", "Bridge Game"
+            )
             
             # Game results webpage
             report_game_results_webpage = ""
             if hasattr(st.session_state, 'game_url') and st.session_state.game_url:
-                report_game_results_webpage = f"Results Page: {st.session_state.game_url}"
+                report_game_results_webpage = chrome_text(
+                    "results_page", "Results Page: {url}"
+                ).format(url=st.session_state.game_url)
             
             # Player match information
             match_info_parts = []
             if hasattr(st.session_state, 'pair_id') and st.session_state.pair_id:
-                match_info_parts.append(f"Your pair was {st.session_state.pair_id}")
+                match_info_parts.append(
+                    chrome_text("your_pair", "Your pair was {pair_id}").format(
+                        pair_id=st.session_state.pair_id
+                    )
+                )
             if hasattr(st.session_state, 'pair_direction') and st.session_state.pair_direction:
                 match_info_parts.append(st.session_state.pair_direction)
             if hasattr(st.session_state, 'section_name') and st.session_state.section_name:
-                match_info_parts.append(f"in section {st.session_state.section_name}")
+                match_info_parts.append(
+                    chrome_text("in_section", "in section {section}").format(
+                        section=st.session_state.section_name
+                    )
+                )
             if hasattr(st.session_state, 'player_direction') and st.session_state.player_direction:
-                match_info_parts.append(f"You played {st.session_state.player_direction}")
+                match_info_parts.append(
+                    chrome_text("you_played", "You played {direction}").format(
+                        direction=st.session_state.player_direction
+                    )
+                )
             if hasattr(st.session_state, 'partner_name') and st.session_state.partner_name:
                 partner_license = getattr(st.session_state, 'partner_license_number', '')
                 if partner_license:
-                    match_info_parts.append(f"Your partner was {st.session_state.partner_name} ({partner_license})")
+                    match_info_parts.append(
+                        chrome_text(
+                            "your_partner_license",
+                            "Your partner was {name} ({license})",
+                        ).format(name=st.session_state.partner_name, license=partner_license)
+                    )
                 else:
-                    match_info_parts.append(f"Your partner was {st.session_state.partner_name}")
+                    match_info_parts.append(
+                        chrome_text("your_partner", "Your partner was {name}").format(
+                            name=st.session_state.partner_name
+                        )
+                    )
             if hasattr(st.session_state, 'partner_direction') and st.session_state.partner_direction:
-                match_info_parts.append(f"who played {st.session_state.partner_direction}")
+                match_info_parts.append(
+                    chrome_text("who_played", "who played {direction}").format(
+                        direction=st.session_state.partner_direction
+                    )
+                )
             
             report_your_match_info = ". ".join(match_info_parts) if match_info_parts else ""
             
@@ -502,13 +596,17 @@ class PostmortemBase(ABC):
                 vetted_prompts = st.session_state.favorites['SelectBoxes']['Vetted_Prompts']
                 sql_query_count = 0
                 
-                for stats in stqdm(selected_button['prompts'], desc='Creating personalized report...'):
+                for stats in stqdm(
+                    selected_button['prompts'],
+                    desc=chrome_text("creating_report", "Creating personalized report..."),
+                ):
                     assert stats[0] == '@', stats
                     stat = vetted_prompts[stats[1:]]
                     section_help = section_help_for_players(
-                        str(stat.get("help") or ""),
+                        localized_field(stat, "help", stat.get("help") or ""),
                         str(st.session_state.get("player_name") or ""),
                         str(st.session_state.get("partner_name") or ""),
+                        language=report_language(),
                     )
                     for i, prompt in enumerate(stat['prompts']):
                         if 'sql' in prompt and prompt['sql']:
@@ -531,14 +629,18 @@ class PostmortemBase(ABC):
                                 pdf_assets.append(query_df)
                             sql_query_count += 1
             except (KeyError, TypeError) as e:
-                st.error(f"Error generating report from favorites: {e}")
+                st.error(chrome_text(
+                    "report_error",
+                    "Error generating report from favorites: {error}",
+                ).format(error=e))
             
             # Go to top button
-            st.markdown('''
+            go_to_top = chrome_text("go_to_top", "Go to top of report")
+            st.markdown(f'''
                 <div style="text-align: center; margin: 20px 0;">
                     <a href="#top-of-report" style="text-decoration: none;">
                         <button style="padding: 8px 16px; background-color: #ff4b4b; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px;">
-                            Go to top of report
+                            {go_to_top}
                         </button>
                     </a>
                 </div>
@@ -562,17 +664,20 @@ class PostmortemBase(ABC):
                     pdf_player_info = getattr(st.session_state, 'player_id', 'Player')
                 
                 if st.session_state.pdf_link.download_button(
-                    label="Download Personalized Report PDF",
+                    label=chrome_text("download_pdf", "Download Personalized Report PDF"),
                     data=streamlitlib.create_pdf(
                         st.session_state.pdf_assets, 
-                        title=f"Bridge Game Postmortem Report Personalized for {pdf_player_info}"
+                        title=chrome_text(
+                            "pdf_title",
+                            "Bridge Game Postmortem Report Personalized for {player}",
+                        ).format(player=pdf_player_info)
                     ),
                     file_name=f"{getattr(st.session_state, 'session_id', 'session')}-{getattr(st.session_state, 'player_id', 'player')}-morty.pdf",
                     disabled=len(st.session_state.pdf_assets) == 0,
                     mime='application/octet-stream',
                     key='personalized_report_download_button'
                 ):
-                    st.warning('Personalized report downloaded.')
+                    st.warning(chrome_text("pdf_downloaded", "Personalized report downloaded."))
             except Exception as e:
                 print(f"Error creating PDF download: {e}")
     

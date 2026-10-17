@@ -514,49 +514,60 @@ class PostmortemBase(ABC):
                     "results_page", "Results Page: {url}"
                 ).format(url=st.session_state.game_url)
             
-            # Player match information
+            # Player match information. Partner seat is one sentence:
+            # "Kazuko OWADA played S", not "NS. You played N. Your partner was ... who played S".
             match_info_parts = []
             if hasattr(st.session_state, 'pair_id') and st.session_state.pair_id:
+                pair_label = str(st.session_state.pair_id)
+                pair_direction = getattr(st.session_state, 'pair_direction', None)
+                if pair_direction:
+                    pair_label = f"{pair_label}{pair_direction}"
                 match_info_parts.append(
                     chrome_text("your_pair", "Your pair was {pair_id}").format(
-                        pair_id=st.session_state.pair_id
+                        pair_id=pair_label
                     )
                 )
-            if hasattr(st.session_state, 'pair_direction') and st.session_state.pair_direction:
-                match_info_parts.append(st.session_state.pair_direction)
             if hasattr(st.session_state, 'section_name') and st.session_state.section_name:
                 match_info_parts.append(
                     chrome_text("in_section", "in section {section}").format(
                         section=st.session_state.section_name
                     )
                 )
-            if hasattr(st.session_state, 'player_direction') and st.session_state.player_direction:
-                match_info_parts.append(
-                    chrome_text("you_played", "You played {direction}").format(
-                        direction=st.session_state.player_direction
-                    )
-                )
-            if hasattr(st.session_state, 'partner_name') and st.session_state.partner_name:
+            partner_name = getattr(st.session_state, 'partner_name', None)
+            partner_direction = getattr(st.session_state, 'partner_direction', None)
+            if partner_name:
                 partner_license = getattr(st.session_state, 'partner_license_number', '')
-                if partner_license:
+                if partner_direction and partner_license:
+                    match_info_parts.append(
+                        chrome_text(
+                            "partner_played_license",
+                            "{name} ({license}) played {direction}",
+                        ).format(
+                            name=partner_name,
+                            license=partner_license,
+                            direction=partner_direction,
+                        )
+                    )
+                elif partner_direction:
+                    match_info_parts.append(
+                        chrome_text("partner_played", "{name} played {direction}").format(
+                            name=partner_name,
+                            direction=partner_direction,
+                        )
+                    )
+                elif partner_license:
                     match_info_parts.append(
                         chrome_text(
                             "your_partner_license",
                             "Your partner was {name} ({license})",
-                        ).format(name=st.session_state.partner_name, license=partner_license)
+                        ).format(name=partner_name, license=partner_license)
                     )
                 else:
                     match_info_parts.append(
                         chrome_text("your_partner", "Your partner was {name}").format(
-                            name=st.session_state.partner_name
+                            name=partner_name
                         )
                     )
-            if hasattr(st.session_state, 'partner_direction') and st.session_state.partner_direction:
-                match_info_parts.append(
-                    chrome_text("who_played", "who played {direction}").format(
-                        direction=st.session_state.partner_direction
-                    )
-                )
             
             report_your_match_info = ". ".join(match_info_parts) if match_info_parts else ""
             

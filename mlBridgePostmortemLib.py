@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Union
 
 from mlBridge.mlBridgeLib import cast_numeric_display_columns
+from mlBridge.postmortem_section_help import section_help_for_players
 
 
 def git_build_stamp(path: pathlib.Path) -> str:
@@ -504,15 +505,20 @@ class PostmortemBase(ABC):
                 for stats in stqdm(selected_button['prompts'], desc='Creating personalized report...'):
                     assert stats[0] == '@', stats
                     stat = vetted_prompts[stats[1:]]
+                    section_help = section_help_for_players(
+                        str(stat.get("help") or ""),
+                        str(st.session_state.get("player_name") or ""),
+                        str(st.session_state.get("partner_name") or ""),
+                    )
                     for i, prompt in enumerate(stat['prompts']):
                         if 'sql' in prompt and prompt['sql']:
                             if i == 0:
                                 streamlit_chat.message(
-                                    f"Morty: {stat['help']}", 
+                                    f"Morty: {section_help}", 
                                     key=f'morty_sql_query_{sql_query_count}', 
                                     logo=getattr(st.session_state, 'assistant_logo', None)
                                 )
-                                pdf_assets.append(f"### {stat['help']}")
+                                pdf_assets.append(f"### {section_help}")
                             
                             prompt_sql = prompt['sql']
                             sql_query = self.process_prompt_macros(prompt_sql)

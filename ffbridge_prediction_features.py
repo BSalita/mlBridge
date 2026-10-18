@@ -241,27 +241,46 @@ def contract_declarer(contract: str) -> str:
     return "NULL" if contract == "PASS" else contract[-1]
 
 
+# ACBL contract accuracy drops at full declarer weight; 0.3 keeps it level
+# and still raises declarer accuracy (chosen on half of a 2026 test sample).
+ACBL_DECLARER_WEIGHT = 0.3
+
+
 def joint_contract_and_declarer(
     contract_classes: list[str],
     contract_probs: np.ndarray,
     direction_classes: list[str],
     direction_probs: np.ndarray,
+    declarer_weight: float = 1.0,
 ) -> tuple[list[str], list[str]]:
     """One contract and its declarer from both models' probabilities.
 
     Each contract is scored by its own probability times the declarer model's
-    probability for that contract's declarer (``NULL`` for a pass-out).
+    probability for that contract's declarer (``NULL`` for a pass-out),
+    raised to ``declarer_weight``.
+    A declarer model trained only on played boards (ACBL) has no ``NULL``
+    class; a pass-out then gets the uniform seat probability, the factor a
+    declarer model with no opinion would give every contract.
     Probability arrays are rows x classes in schema class order.
     """
     contract_probs = np.asarray(contract_probs, dtype=np.float64)
     direction_probs = np.asarray(direction_probs, dtype=np.float64)
     direction_index = {name: index for index, name in enumerate(direction_classes)}
-    missing = sorted({contract_declarer(name) for name in contract_classes} - set(direction_index))
+    no_declarer = "NULL" not in direction_index
+    missing = sorted(
+        {contract_declarer(name) for name in contract_classes}
+        - set(direction_index)
+        - ({"NULL"} if no_declarer else set())
+    )
     if missing:
         raise ValueError(f"Declarer model has no class for {missing}")
+    if no_declarer:
+        neutral = np.full((direction_probs.shape[0], 1), 1.0 / len(direction_classes))
+        direction_probs = np.hstack([direction_probs, neutral])
+        direction_index["NULL"] = len(direction_classes)
     seat = np.array([direction_index[contract_declarer(name)] for name in contract_classes])
     with np.errstate(divide="ignore"):
-        score = np.log(contract_probs) + np.log(direction_probs[:, seat])
+        score = np.log(contract_probs) + declarer_weight * np.log(direction_probs[:, seat])
     best = score.argmax(axis=1)
     contracts = [contract_classes[index] for index in best]
     return contracts, [contract_declarer(name) for name in contracts]

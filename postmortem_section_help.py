@@ -11,6 +11,11 @@ from __future__ import annotations
 
 import re
 
+
+def section_waits_on_row_click(favorite_id: str) -> bool:
+    """Ranking sections rebuild the report grids when a row is clicked."""
+    return "rank" in str(favorite_id or "").casefold()
+
 _HELP_PLAYER1_RE = re.compile(r"\{player1_name\}")
 _HELP_PLAYER2_RE = re.compile(r"\{player2_name\}")
 _HELP_YOU_AND_PARTNER_RE = re.compile(r"\byou and your partner\b", re.IGNORECASE)

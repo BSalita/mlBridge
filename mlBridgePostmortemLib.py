@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Mapping, Optional, Any, Union
 
 from mlBridge.mlBridgeLib import cast_numeric_display_columns
-from mlBridge.postmortem_section_help import section_help_for_players
+from mlBridge.postmortem_section_help import section_help_for_players, section_waits_on_row_click
 
 
 def git_build_stamp(path: pathlib.Path) -> str:
@@ -199,7 +199,7 @@ class PostmortemBase(ABC):
                 self.write_report()
         self.ask_sql_query()
     
-    def ShowDataFrameTable(self, df: Optional[pl.DataFrame], key: str, query: str = 'SELECT * FROM self', show_sql_query: bool = True, height_rows: int = 4) -> Optional[pl.DataFrame]:
+    def ShowDataFrameTable(self, df: Optional[pl.DataFrame], key: str, query: str = 'SELECT * FROM self', show_sql_query: bool = True, height_rows: int = 4, hourglass_on_row_click: bool = False) -> Optional[pl.DataFrame]:
         """Display a DataFrame table in Streamlit with optional SQL query execution
         
         Args:
@@ -237,7 +237,12 @@ class PostmortemBase(ABC):
             # Import streamlitlib for display
             sys.path.append(str(pathlib.Path.cwd().joinpath('streamlitlib')))
             import streamlitlib
-            streamlitlib.ShowDataFrameTable(result_df, key, height_rows=height_rows)
+            streamlitlib.ShowDataFrameTable(
+                result_df,
+                key,
+                height_rows=height_rows,
+                hourglass_on_row_click=hourglass_on_row_click,
+            )
         except Exception as e:
             st.error(f"duckdb exception: error:{e} query:{query}")
             return None
@@ -612,7 +617,8 @@ class PostmortemBase(ABC):
                     desc=chrome_text("creating_report", "Creating personalized report..."),
                 ):
                     assert stats[0] == '@', stats
-                    stat = vetted_prompts[stats[1:]]
+                    favorite_id = stats[1:]
+                    stat = vetted_prompts[favorite_id]
                     section_help = section_help_for_players(
                         localized_field(stat, "help", stat.get("help") or ""),
                         str(st.session_state.get("player_name") or ""),
@@ -634,7 +640,8 @@ class PostmortemBase(ABC):
                             query_df = self.ShowDataFrameTable(
                                 st.session_state.df, 
                                 query=sql_query, 
-                                key=f'sql_query_{sql_query_count}'
+                                key=f'sql_query_{sql_query_count}',
+                                hourglass_on_row_click=section_waits_on_row_click(favorite_id),
                             )
                             if query_df is not None:
                                 pdf_assets.append(query_df)
@@ -644,6 +651,9 @@ class PostmortemBase(ABC):
                     "report_error",
                     "Error generating report from favorites: {error}",
                 ).format(error=e))
+
+            if streamlitlib is not None:
+                streamlitlib.clear_row_click_hourglass()
             
             # Go to top button
             go_to_top = chrome_text("go_to_top", "Go to top of report")

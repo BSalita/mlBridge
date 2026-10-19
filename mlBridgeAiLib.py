@@ -1608,8 +1608,13 @@ def generate_and_save_schema_core(
             # the 2026-07 club classifiers (see acbl/RESULTS.md). The
             # DROP_PATTERNS in acbl_prediction_data.py only drop String
             # columns, so club's numeric IDs slip through to training --
-            # exclude them here at schema time instead.
-            r'^(event_id|session_id|group_id|session_number)$',
+            # exclude them here at schema time instead. section_id and Club
+            # were still scaled numeric inputs to the 2026-10 club models;
+            # test section_ids lie beyond the whole training range.
+            r'^(event_id|session_id|section_id|group_id|session_number|Club)$',
+            # Dates scale to timestamps. With a time split every test date is
+            # outside the training range, so they only teach a trend.
+            r'^(Date|game_date)$',
             # Add more regex patterns as needed:
             # r'^id$',             # Exact match for 'id' column
             # r'^temp_.*',         # Any column starting with 'temp_'

@@ -3464,13 +3464,13 @@ def train_model_from_shards(
     schema: Dict[str, Any],
     # 🚫 TRAINING-ONLY PARAMETERS: Do not affect inference
     valid_pct: float = 0.01,
-    bs: int = 32768,  # Will be adjusted for classification
+    bs: Optional[int] = None,
     epochs: int = 3,
     device: str = 'cuda',
-    lr: float = 2e-3,  # Will be adjusted for classification
+    lr: Optional[float] = None,
     seed: Optional[int] = 42,
     use_amp: bool = True,
-    weight_decay: float = 1e-4,  # Will be adjusted for classification
+    weight_decay: Optional[float] = None,
     verbose: bool = False,
     save_model: bool = True,
     early_stop_patience: int = 0,
@@ -3486,13 +3486,14 @@ def train_model_from_shards(
     
     🚫 TRAINING-ONLY PARAMETERS (do not affect inference):
     - valid_pct: Validation split percentage
-    - bs: Batch size (auto-adjusted: 32768 for regression, 4096 for classification)
+    - bs: Batch size (default 32768 for regression, 4096 for classification)
     - epochs: Number of training epochs
     - device: Training device ('cuda' or 'cpu')
-    - lr: Learning rate (auto-adjusted: 2e-3 for regression, 1e-3 for classification)
+    - lr: Learning rate (default 2e-3 for regression, 1e-3 for classification)
     - seed: Random seed for reproducibility
     - use_amp: Use automatic mixed precision
-    - weight_decay: L2 regularization (auto-adjusted: 1e-4 for regression, 1e-5 for classification)
+    - weight_decay: L2 regularization (default 1e-4 for regression, 1e-5 for classification)
+      Explicit bs, lr, and weight_decay values are used as given.
     - verbose: Print training progress
     - save_model: Save trained model to disk
     - resident_data: Load every shard onto the device once instead of
@@ -3505,13 +3506,13 @@ def train_model_from_shards(
         return train_model_regression_from_shards(
             schema=schema,
             valid_pct=valid_pct,
-            bs=bs,
+            bs=32768 if bs is None else bs,
             epochs=epochs,
             device=device,
-            lr=lr,
+            lr=2e-3 if lr is None else lr,
             seed=seed,
             use_amp=use_amp,
-            weight_decay=weight_decay,
+            weight_decay=1e-4 if weight_decay is None else weight_decay,
             verbose=verbose,
             save_model=save_model,
             early_stop_patience=early_stop_patience,
@@ -3519,21 +3520,16 @@ def train_model_from_shards(
             shards=shards,
         )
     else:
-        # Auto-adjust parameters for classification
-        classification_bs = 4096 if bs == 32768 else bs  # Use default or user override
-        classification_lr = 1e-3 if lr == 2e-3 else lr  # Use default or user override
-        classification_weight_decay = 1e-5 if weight_decay == 1e-4 else weight_decay  # Use default or user override
-        
         return train_model_classification_from_shards(
             schema=schema,
             valid_pct=valid_pct,
-            bs=classification_bs,
+            bs=4096 if bs is None else bs,
             epochs=epochs,
             device=device,
-            lr=classification_lr,
+            lr=1e-3 if lr is None else lr,
             seed=seed,
             use_amp=use_amp,
-            weight_decay=classification_weight_decay,
+            weight_decay=1e-5 if weight_decay is None else weight_decay,
             verbose=verbose,
             save_model=save_model,
             early_stop_patience=early_stop_patience,

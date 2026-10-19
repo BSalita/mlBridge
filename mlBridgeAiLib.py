@@ -394,10 +394,15 @@ def predict_batches(
     return preds
 
 
-def load_shard_data(shard_file: pathlib.Path) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+def _shard_payload(shard: Union[pathlib.Path, Dict[str, Any]]) -> Dict[str, Any]:
+    return shard if isinstance(shard, dict) else torch.load(shard, map_location='cpu')
+
+
+def load_shard_data(shard_file: Union[pathlib.Path, Dict[str, Any]]) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
     Purpose:
-        Load a shard produced via torch.save with keys 'X_cont', 'X_cat' (optional), and 'y'.
+        Load a shard produced via torch.save with keys 'X_cont', 'X_cat' (optional), and 'y',
+        or take those tensors from an in-memory shard built by build_torch_shards.
 
     Behavior:
         - X_cont is converted to float32 and NaNs/±inf are cleaned (0.0, ±1e6).
@@ -414,7 +419,7 @@ def load_shard_data(shard_file: pathlib.Path) -> Tuple[torch.Tensor, Optional[to
           - X_cat:  torch.LongTensor [N, K] or None
           - y:      torch.FloatTensor [N] or torch.LongTensor [N]
     """
-    payload = torch.load(shard_file, map_location='cpu')
+    payload = _shard_payload(shard_file)
     X_cont = payload.get('X_cont', None)
     X_cat = payload.get('X_cat', None)
     y_val = payload.get('y')
@@ -2714,14 +2719,8 @@ def create_torch_shards(
     Return:
         List[pathlib.Path]: paths to written shard files.
     """
-    y_name = schema.get('target_column')
-    if not y_name:
+    if not schema.get('target_column'):
         raise ValueError("schema missing 'target_column'")
-
-    numerical_feature_cols = schema.get("numerical_feature_cols", [])
-    categorical_feature_cols = schema.get("categorical_feature_cols", [])
-    category_mappings = schema.get("category_mappings", {})
-    cat_feature_info = schema.get("cat_feature_info", {})
 
     # Output location
     saved_models_path = pathlib.Path(schema.get('saved_models_path', '.'))
@@ -2739,99 +2738,11 @@ def create_torch_shards(
             except Exception:
                 pass
 
-    # Decide scaling behavior
-    scaling_params = schema.get("scaling_params", {})
-    schema_wants_scaling = bool(schema.get("apply_scaling", True))
-    do_scale =  apply_scaling and scaling_params and schema_wants_scaling
-
-    # Task detection (use model_type; fallback to class_to_idx presence)
-    is_classification = (schema.get('model_type') == 'classification') or ('class_to_idx' in schema)
-    class_to_idx: Dict[Any, int] = schema.get('class_to_idx', {}) if is_classification else {}
-
     written: List[pathlib.Path] = []
     shard_index = 0
     for start in tqdm(range(0, df.height, shard_rows_count), desc="creating shards"):
         end = min(start + shard_rows_count, df.height)
-        shard_df = df.slice(start, end - start)
-
-        tensors: Dict[str, torch.Tensor] = {}
-
-        # Numeric: see df_to_float32_matrix -- with the ~1.4 TB training df
-        # resident, any full-shard-size temporary risks the commit limit
-        # (OOM'd at shard 7/31 on 2026-08-19, then 23/62 the same day).
-        numerical_data = df_to_float32_matrix(shard_df, numerical_feature_cols)
-
-        if do_scale:
-            for j, col in enumerate(numerical_feature_cols):
-                p = scaling_params.get(col)
-                if not p:
-                    continue
-                mean = float(p.get("mean", 0.0))
-                std = float(p.get("std", 1.0)) or 1.0
-                numerical_data[:, j] = (numerical_data[:, j] - mean) / std
-
-        tensors["X_cont"] = torch.from_numpy(numerical_data)
-
-        # Categorical: map to indices
-        categorical_data_list: List[np.ndarray] = []
-        for col in categorical_feature_cols:
-            col_series = shard_df[col]
-            mapping = category_mappings.get(col, {})
-            # Ensure mapping keys are strings to match Utf8 casting
-            if mapping and not all(isinstance(k, str) for k in mapping.keys()):
-                mapping = {str(k): v for k, v in mapping.items()}
-            unknown_idx = int(cat_feature_info.get(col, len(mapping)))
-            mapped_values = (
-                col_series
-                .cast(pl.Utf8)
-                .replace_strict(mapping, default=unknown_idx, return_dtype=pl.Int64)
-                .fill_null(unknown_idx)
-                .to_numpy()
-                .astype(np.int64)
-            )
-            categorical_data_list.append(mapped_values)
-
-        if categorical_data_list:
-            tensors["X_cat"] = torch.tensor(np.stack(categorical_data_list, axis=1), dtype=torch.int64)
-        else:
-            tensors["X_cat"] = torch.empty((shard_df.height, 0), dtype=torch.int64)
-
-        # Target
-        if is_classification:
-            # Map labels to class indices using schema mapping; unseen -> 0 by default
-            unknown_class_index = 0
-            if class_to_idx:
-                try:
-                    # Normalize class_to_idx keys to strings to match Utf8 casting
-                    _class_to_idx = class_to_idx if all(isinstance(k, str) for k in class_to_idx.keys()) else {str(k): v for k, v in class_to_idx.items()}
-                    mapped = (
-                        shard_df.select(
-                            pl.col(y_name)
-                            .cast(pl.Utf8)
-                            .replace_strict(_class_to_idx, default=unknown_class_index, return_dtype=pl.Int64)
-                            .alias(y_name)
-                        )
-                        .to_numpy()
-                        .ravel()
-                        .astype(np.int64)
-                    )
-                except Exception:
-                    # Fallback to Python mapping if replace_strict incompatible
-                    labels_np = shard_df[y_name].to_numpy()
-                    mapped = np.array([class_to_idx.get(v, unknown_class_index) for v in labels_np], dtype=np.int64)
-            else:
-                # No mapping present; attempt to ordinal-encode deterministically by string
-                labels_np = shard_df[y_name].to_numpy()
-                uniq = sorted(set([v for v in labels_np if v is not None]), key=lambda x: str(x))
-                local_map = {c: i for i, c in enumerate(uniq)}
-                mapped = np.array([local_map.get(v, 0) for v in labels_np], dtype=np.int64)
-            tensors["y"] = torch.from_numpy(mapped)
-        else:
-            y = torch.tensor(shard_df[y_name].to_numpy(), dtype=torch.float32)
-            y = torch.nan_to_num(y, nan=0.5).clip(0.0, 1.0)
-            tensors["y"] = y
-
-        tensors["meta"] = {"scaled": bool(do_scale)}
+        tensors = _shard_tensors(df.slice(start, end - start), schema, apply_scaling)
 
         shard_path = resolve_shards_path(saved_models_path, model_name, shard_index)
         torch.save(tensors, shard_path)
@@ -2840,10 +2751,130 @@ def create_torch_shards(
         # Release shard-sized objects NOW rather than at next-iteration
         # rebinding, so two shards' worth of tensors never coexist (matters
         # when running near the Windows commit limit; see note above).
-        del tensors, numerical_data, categorical_data_list
+        del tensors
         gc.collect()
 
     return written
+
+
+def build_torch_shards(
+    df: pl.DataFrame,
+    schema: Dict[str, Any],
+    shard_rows_count: int = 500_000,
+    apply_scaling: bool = True,
+) -> List[Dict[str, Any]]:
+    """
+    Same shard tensors as create_torch_shards, kept in memory instead of
+    written to disk. Pass the result as ``shards=`` to train_model_from_shards.
+    Holds every shard at once, so use it only when the data fits in RAM.
+    """
+    if not schema.get('target_column'):
+        raise ValueError("schema missing 'target_column'")
+    return [
+        _shard_tensors(df.slice(start, min(shard_rows_count, df.height - start)), schema, apply_scaling)
+        for start in tqdm(range(0, df.height, shard_rows_count), desc="building shards")
+    ]
+
+
+def _shard_tensors(shard_df: pl.DataFrame, schema: Dict[str, Any], apply_scaling: bool) -> Dict[str, Any]:
+    y_name = schema['target_column']
+    numerical_feature_cols = schema.get("numerical_feature_cols", [])
+    categorical_feature_cols = schema.get("categorical_feature_cols", [])
+    category_mappings = schema.get("category_mappings", {})
+    cat_feature_info = schema.get("cat_feature_info", {})
+
+    # Decide scaling behavior
+    scaling_params = schema.get("scaling_params", {})
+    schema_wants_scaling = bool(schema.get("apply_scaling", True))
+    do_scale = apply_scaling and scaling_params and schema_wants_scaling
+
+    # Task detection (use model_type; fallback to class_to_idx presence)
+    is_classification = (schema.get('model_type') == 'classification') or ('class_to_idx' in schema)
+    class_to_idx: Dict[Any, int] = schema.get('class_to_idx', {}) if is_classification else {}
+
+    tensors: Dict[str, Any] = {}
+
+    # Numeric: see df_to_float32_matrix -- with the ~1.4 TB training df
+    # resident, any full-shard-size temporary risks the commit limit
+    # (OOM'd at shard 7/31 on 2026-08-19, then 23/62 the same day).
+    numerical_data = df_to_float32_matrix(shard_df, numerical_feature_cols)
+
+    if do_scale:
+        means = np.zeros(len(numerical_feature_cols), dtype=np.float32)
+        stds = np.ones(len(numerical_feature_cols), dtype=np.float32)
+        for j, col in enumerate(numerical_feature_cols):
+            p = scaling_params.get(col)
+            if not p:
+                continue
+            means[j] = float(p.get("mean", 0.0))
+            stds[j] = float(p.get("std", 1.0)) or 1.0
+        # Whole-matrix ops: per-column slices of a row-major matrix are strided.
+        numerical_data -= means
+        numerical_data /= stds
+
+    tensors["X_cont"] = torch.from_numpy(numerical_data)
+
+    # Categorical: map to indices
+    categorical_data_list: List[np.ndarray] = []
+    for col in categorical_feature_cols:
+        col_series = shard_df[col]
+        mapping = category_mappings.get(col, {})
+        # Ensure mapping keys are strings to match Utf8 casting
+        if mapping and not all(isinstance(k, str) for k in mapping.keys()):
+            mapping = {str(k): v for k, v in mapping.items()}
+        unknown_idx = int(cat_feature_info.get(col, len(mapping)))
+        mapped_values = (
+            col_series
+            .cast(pl.Utf8)
+            .replace_strict(mapping, default=unknown_idx, return_dtype=pl.Int64)
+            .fill_null(unknown_idx)
+            .to_numpy()
+            .astype(np.int64)
+        )
+        categorical_data_list.append(mapped_values)
+
+    if categorical_data_list:
+        tensors["X_cat"] = torch.tensor(np.stack(categorical_data_list, axis=1), dtype=torch.int64)
+    else:
+        tensors["X_cat"] = torch.empty((shard_df.height, 0), dtype=torch.int64)
+
+    # Target
+    if is_classification:
+        # Map labels to class indices using schema mapping; unseen -> 0 by default
+        unknown_class_index = 0
+        if class_to_idx:
+            try:
+                # Normalize class_to_idx keys to strings to match Utf8 casting
+                _class_to_idx = class_to_idx if all(isinstance(k, str) for k in class_to_idx.keys()) else {str(k): v for k, v in class_to_idx.items()}
+                mapped = (
+                    shard_df.select(
+                        pl.col(y_name)
+                        .cast(pl.Utf8)
+                        .replace_strict(_class_to_idx, default=unknown_class_index, return_dtype=pl.Int64)
+                        .alias(y_name)
+                    )
+                    .to_numpy()
+                    .ravel()
+                    .astype(np.int64)
+                )
+            except Exception:
+                # Fallback to Python mapping if replace_strict incompatible
+                labels_np = shard_df[y_name].to_numpy()
+                mapped = np.array([class_to_idx.get(v, unknown_class_index) for v in labels_np], dtype=np.int64)
+        else:
+            # No mapping present; attempt to ordinal-encode deterministically by string
+            labels_np = shard_df[y_name].to_numpy()
+            uniq = sorted(set([v for v in labels_np if v is not None]), key=lambda x: str(x))
+            local_map = {c: i for i, c in enumerate(uniq)}
+            mapped = np.array([local_map.get(v, 0) for v in labels_np], dtype=np.int64)
+        tensors["y"] = torch.from_numpy(mapped)
+    else:
+        y = torch.tensor(shard_df[y_name].to_numpy(), dtype=torch.float32)
+        y = torch.nan_to_num(y, nan=0.5).clip(0.0, 1.0)
+        tensors["y"] = y
+
+    tensors["meta"] = {"scaled": bool(do_scale)}
+    return tensors
 
 
 def iter_torch_shards_raw(
@@ -3334,6 +3365,7 @@ def train_model_regression_from_shards(
     save_model: bool = True,
     early_stop_patience: int = 0,
     resident_data: bool = False,
+    shards: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     # Validate schema and target
     y_name = schema.get('target_column')
@@ -3372,9 +3404,9 @@ def train_model_regression_from_shards(
     model_name = schema.get('model_name')
     if not model_name:
         raise ValueError("schema missing 'model_name'")
-    shard_files = sorted(saved_models_path.glob(model_name + '_shard_*.pt'))
+    shard_files = shards if shards is not None else sorted(saved_models_path.glob(model_name + '_shard_*.pt'))
     assert shard_files, f"No shard_*.pt files in {saved_models_path}"
-    sample_payload = torch.load(shard_files[0], map_location='cpu')
+    sample_payload = _shard_payload(shard_files[0])
     Xc_sample: torch.Tensor = sample_payload.get('X_cont', torch.empty(0))
     input_dim = int(Xc_sample.shape[1]) if Xc_sample.ndim == 2 else 0
 
@@ -3444,6 +3476,7 @@ def train_model_from_shards(
     early_stop_patience: int = 0,
     class_weights: Optional[List[float]] = None,
     resident_data: bool = False,
+    shards: Optional[List[Dict[str, Any]]] = None,
 ):
     """
     Train model from shards using schema parameters.
@@ -3464,6 +3497,8 @@ def train_model_from_shards(
     - save_model: Save trained model to disk
     - resident_data: Load every shard onto the device once instead of
       re-reading shards each epoch; all shards must fit in device memory.
+    - shards: In-memory shards from build_torch_shards, used instead of the
+      shard files in schema['saved_models_path'].
     """
     model_type = schema.get('model_type') or ('classification' if 'class_to_idx' in schema else 'regression')
     if model_type == 'regression':
@@ -3481,6 +3516,7 @@ def train_model_from_shards(
             save_model=save_model,
             early_stop_patience=early_stop_patience,
             resident_data=resident_data,
+            shards=shards,
         )
     else:
         # Auto-adjust parameters for classification
@@ -3503,6 +3539,7 @@ def train_model_from_shards(
             early_stop_patience=early_stop_patience,
             class_weights=class_weights,
             resident_data=resident_data,
+            shards=shards,
         )
 
 
@@ -3722,6 +3759,7 @@ def train_model_classification_from_shards(
     early_stop_patience: int = 0,
     class_weights: Optional[List[float]] = None,
     resident_data: bool = False,
+    shards: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     """
     Train a classifier from shard files created by create_torch_shards.
@@ -3732,6 +3770,7 @@ def train_model_classification_from_shards(
         seed: Optional random seed for reproducible training results.
         resident_data: Load every shard onto the device once (all must fit in
             device memory) instead of re-reading shards each epoch.
+        shards: In-memory shards from build_torch_shards, used instead of files.
     """
     saved_models_path = pathlib.Path(schema.get('saved_models_path', '.'))
     model_name = schema.get('model_name')
@@ -3763,9 +3802,9 @@ def train_model_classification_from_shards(
     categorical_feature_cols = schema.get('categorical_feature_cols', [])
 
     # Gather shards
-    shard_files = sorted(saved_models_path.glob(model_name + '_shard_*.pt'))
+    shard_files = shards if shards is not None else sorted(saved_models_path.glob(model_name + '_shard_*.pt'))
     assert shard_files, f"No shard_*.pt files in {saved_models_path}"
-    sample_payload = torch.load(shard_files[0], map_location='cpu')
+    sample_payload = _shard_payload(shard_files[0])
     Xc_sample: torch.Tensor = sample_payload.get('X_cont', torch.empty(0))
     Xk_sample: Optional[torch.Tensor] = sample_payload.get('X_cat', None)
     y_sample: torch.Tensor = sample_payload.get('y', torch.empty(0, dtype=torch.long))
@@ -4235,7 +4274,7 @@ def predict_regression_model(saved_models_path: pathlib.Path, model_name: str, d
     Xc = torch.as_tensor(Xc, dtype=torch.float32)
     Xk = None if Xk is None or (hasattr(Xk, 'numel') and Xk.numel() == 0) else torch.as_tensor(Xk, dtype=torch.int64)
 
-    preds: List[float] = []
+    pred_batches: List[torch.Tensor] = []
     bs = 8192
     
     print(f"DEBUG: Starting inference with {Xc.shape[0]} samples, batch_size={bs}")
@@ -4310,11 +4349,9 @@ def predict_regression_model(saved_models_path: pathlib.Path, model_name: str, d
                         print(f"  Min: {min(vals):.6f}, Max: {max(vals):.6f}")
                         print(f"  Sample: {[f'{x:.6f}' for x in vals[:5]]}")
                     
-            batch_preds = yb.cpu().tolist()
-            # Handle case where batch_preds is a single float (batch size 1)
-            if isinstance(batch_preds, float):
-                batch_preds = [batch_preds]
-            preds.extend(batch_preds)
+            pred_batches.append(yb.reshape(-1))
+    preds_np = torch.cat(pred_batches).float().cpu().numpy().astype(np.float64) if pred_batches else np.empty(0)
+    preds = preds_np.tolist()
 
     # Optional recentering: previously enforced mean ~0.5 for probability targets.
     # Disabled by default to preserve model calibration; enable via schema['recenter_outputs']=True if desired.
@@ -4397,14 +4434,15 @@ def predict_regression_model(saved_models_path: pathlib.Path, model_name: str, d
             print(f"DEBUG[REG] Final preds stats: mean={float(np.mean(arr)):.6f}, std={float(np.std(arr)):.6f}, min={float(np.min(arr)):.6f}, max={float(np.max(arr)):.6f}, unique={int(len(np.unique(arr)))}")
     except Exception:
         pass
+    preds_np = np.asarray(preds, dtype=np.float64)
     out_cols = {
-        f'{y_name}_Pred': preds,
+        f'{y_name}_Pred': pl.Series(preds_np),
     }
     if y_name in test_subset_df.columns:
         actual_values = test_subset_df[y_name].to_numpy()
-        errors = actual_values - np.array(preds)
-        out_cols[f'{y_name}_Pred_Error'] = errors.tolist()
-        out_cols[f'{y_name}_Pred_Absolute_Error'] = np.abs(errors).tolist()
+        errors = actual_values - preds_np
+        out_cols[f'{y_name}_Pred_Error'] = pl.Series(errors)
+        out_cols[f'{y_name}_Pred_Absolute_Error'] = pl.Series(np.abs(errors))
 
     return pl.DataFrame(out_cols)
 
@@ -4782,14 +4820,16 @@ def predict_classification_model(
         # For concatenation approach, categorical features should be float
         Xk = None if Xk is None or (hasattr(Xk, 'numel') and Xk.numel() == 0) else torch.as_tensor(Xk, dtype=torch.float32)
 
-    pred_codes: List[int] = []
-    topk_codes: List[List[int]] = []
-    probs_out: List[List[float]] = []
+    # Batch outputs stay on the device and come back as one array each:
+    # per-batch .tolist() into Python lists cost tens of seconds on millions of rows.
+    pred_batches: List[torch.Tensor] = []
+    topk_batches: List[torch.Tensor] = []
+    prob_batches: List[torch.Tensor] = []
+    max_prob_batches: List[torch.Tensor] = []
 
     bs = 8192
     temperature = float(schema.get('temperature', 1.0) or 1.0)
     with torch.no_grad():
-        max_prob_values: List[float] = []
         for i in range(0, Xc.shape[0], bs):
             xb_cont = Xc[i:i+bs].to(device_t, non_blocking=True)
             xb_cat = None if Xk is None else Xk[i:i+bs].to(device_t, non_blocking=True)
@@ -4805,36 +4845,25 @@ def predict_classification_model(
                     logits = logits / float(temperature)
                 batch_probs = F.softmax(logits, dim=-1)
                 batch_pred = torch.argmax(batch_probs, dim=-1)
-            batch_pred_list = batch_pred.cpu().tolist()
-            pred_codes.extend(batch_pred_list)
-            
-            # Debug: Show raw model outputs for first few predictions
-            if len(pred_codes) <= 5:  # Only for first batch
-                batch_probs_list = batch_probs.cpu().tolist()
-                for j in range(min(5, len(batch_pred_list))):
-                    pred_idx = batch_pred_list[j]
-                    probs = batch_probs_list[j]
-                    top_5_probs = sorted(enumerate(probs), key=lambda x: x[1], reverse=True)[:5]
-                    print(f"DEBUG: Sample {len(pred_codes)-len(batch_pred_list)+j}: predicted_idx={pred_idx}, top_5_probs={top_5_probs}")
-            
-            # Collect max-probability for diagnostics
-            try:
-                max_prob_values.extend(torch.max(batch_probs, dim=1).values.cpu().tolist())
-            except Exception:
-                pass
+            pred_batches.append(batch_pred)
+            max_prob_batches.append(torch.max(batch_probs, dim=1).values)
             if return_probs:
-                probs_out.extend(batch_probs.cpu().tolist())
+                prob_batches.append(batch_probs)
             if top_k and top_k > 1:
                 topk = torch.topk(batch_probs, k=min(top_k, batch_probs.shape[1]), dim=-1)
-                topk_codes.extend(topk.indices.cpu().tolist())
+                topk_batches.append(topk.indices)
+
+    def _host(batches: List[torch.Tensor]) -> np.ndarray:
+        return torch.cat(batches).cpu().numpy()
+
+    pred_codes = _host(pred_batches) if pred_batches else np.empty(0, dtype=np.int64)
+    probs_np = _host(prob_batches) if prob_batches else None
+    topk_np = _host(topk_batches) if topk_batches else None
 
     # Print prediction confidence summary
-    try:
-        if max_prob_values:
-            mp = np.array(max_prob_values, dtype=float)
-            print(f"DEBUG[CLS] Confidence stats: mean={mp.mean():.4f}, std={mp.std():.4f}, min={mp.min():.4f}, max={mp.max():.4f}")
-    except Exception:
-        pass
+    if max_prob_batches:
+        mp = _host(max_prob_batches).astype(np.float64)
+        print(f"DEBUG[CLS] Confidence stats: mean={mp.mean():.4f}, std={mp.std():.4f}, min={mp.min():.4f}, max={mp.max():.4f}")
 
     # Build label mapping
     if idx_to_class is None and classes is not None:
@@ -4861,10 +4890,10 @@ def predict_classification_model(
             sample_map = {k: idx_to_class[k] for k in sample_keys}
             print(f"DEBUG[CLS] idx_to_class sample (first 20): {sample_map}")
         # Predicted code counts top 20
-        if pred_codes:
-            import collections as _collections
-            cnt = _collections.Counter(pred_codes)
-            top20 = cnt.most_common(20)
+        if pred_codes.size:
+            counts = np.bincount(pred_codes)
+            order = np.argsort(-counts, kind='stable')
+            top20 = [(int(k), int(counts[k])) for k in order[:20] if counts[k]]
             if idx_to_class is not None:
                 top20_lbl = [(idx_to_class.get(k, k), v) for k, v in top20]
                 print(f"DEBUG[CLS] Top-20 predicted labels: {top20_lbl}")
@@ -4886,17 +4915,22 @@ def predict_classification_model(
     out_cols: Dict[str, Any] = {}
     # Predicted labels (class names) - prioritize over codes
     if idx_to_class is not None:
-        pred_labels = [idx_to_class.get(i, i) for i in pred_codes]
-        out_cols[f'{base_name}_Pred'] = pred_labels
+        width = max(int(pred_codes.max()) + 1 if pred_codes.size else 0, max(idx_to_class) + 1 if idx_to_class else 0)
+        labels = [idx_to_class.get(i, i) for i in range(width)]
+        out_cols[f'{base_name}_Pred'] = [labels[i] for i in pred_codes.tolist()]
     else:
-        out_cols[f'{base_name}_Pred'] = pred_codes
+        out_cols[f'{base_name}_Pred'] = pl.Series(pred_codes.astype(np.int64))
 
     # Optional probabilities
     if return_probs:
-        out_cols[f'{base_name}_Probs'] = probs_out
+        out_cols[f'{base_name}_Probs'] = (
+            pl.Series(probs_np.astype(np.float64)).cast(pl.List(pl.Float64))
+            if probs_np is not None else pl.Series([], dtype=pl.List(pl.Float64))
+        )
 
     # Optional top-k
     if top_k and top_k > 1:
+        topk_codes = topk_np.astype(np.int64).tolist() if topk_np is not None else []
         out_cols[f'{base_name}_Top{top_k}_Pred_Codes'] = topk_codes
         if idx_to_class is not None:
             topk_labels = [[idx_to_class.get(i, i) for i in row] for row in topk_codes]

@@ -221,7 +221,10 @@ def train_one_epoch(
     grad_clip: Optional[float] = 1.0
 ) -> Tuple[float, int]:
     model.train()
-    total_loss, total_count = 0.0, 0
+    # Loss and counts stay on the device: a per-batch .item() or boolean index
+    # forces a host sync on every step.
+    loss_sum = torch.zeros((), dtype=torch.float32, device=device_t)
+    count_sum = torch.zeros((), dtype=torch.int64, device=device_t)
     for xb_cont, xb_cat, yb in iterator:
         xb_cont = xb_cont.to(device_t, non_blocking=True)
         xb_cat = xb_cat.to(device_t, non_blocking=True) if xb_cat is not None else None
@@ -234,9 +237,12 @@ def train_one_epoch(
             if y_range is not None and not getattr(model, 'use_sigmoid', False):
                 pred = pred.clamp(*y_range)
             mask = torch.isfinite(pred) & torch.isfinite(yb)
-            if not mask.any():
-                continue
-            loss = loss_fn(pred[mask], yb[mask])
+            n_valid = mask.sum()
+            # Non-finite rows become 0 vs 0 (zero elementwise loss); rescaling the
+            # mean by numel / n_valid gives the mean over finite rows only.
+            loss = loss_fn(torch.where(mask, pred, 0), torch.where(mask, yb, 0)) * (
+                mask.numel() / n_valid.clamp_min(1)
+            )
         if use_amp and device_t.type == 'cuda':
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -249,9 +255,9 @@ def train_one_epoch(
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
-        total_loss += loss.item() * mask.sum().item()
-        total_count += mask.sum().item()
-    return total_loss, total_count
+        loss_sum += loss.detach().float() * n_valid
+        count_sum += n_valid
+    return float(loss_sum.item()), int(count_sum.item())
 
 
 def eval_one_epoch(
@@ -444,6 +450,34 @@ def shard_batch_iterator(files: List[pathlib.Path], batch_size: int):
         X_cont, X_cat, y = load_shard_data(f)
         for xb_cont, xb_cat, yb in iterate_batches(X_cont, X_cat, y, batch_size):
             yield xb_cont, xb_cat, yb
+
+
+def resident_shard_iter_fn(files: List[pathlib.Path], batch_size: int, device: str):
+    """
+    Purpose:
+        Load shards onto the training device once; each call of the returned
+        function yields the same mini-batches as shard_batch_iterator, without
+        re-reading files or copying from host memory every epoch.
+
+    Args:
+        files: List of shard file paths. Every shard must fit in device memory.
+        batch_size: Rows per batch to emit.
+        device: Training device string ('cuda' or 'cpu').
+    """
+    device_t = torch.device(device if device != 'cpu' and torch.cuda.is_available() else 'cpu')
+    shards = []
+    for f in files:
+        X_cont, X_cat, y = load_shard_data(f)
+        shards.append((
+            X_cont.to(device_t),
+            X_cat.to(device_t) if X_cat is not None else None,
+            y.to(device_t),
+        ))
+
+    def _fn():
+        for X_cont, X_cat, y in shards:
+            yield from iterate_batches(X_cont, X_cat, y, batch_size)
+    return _fn
 
 
 def resolve_model_path(saved_models_path: pathlib.Path, model_name: str) -> pathlib.Path:
@@ -3299,6 +3333,7 @@ def train_model_regression_from_shards(
     verbose: bool = False,
     save_model: bool = True,
     early_stop_patience: int = 0,
+    resident_data: bool = False,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     # Validate schema and target
     y_name = schema.get('target_column')
@@ -3347,13 +3382,20 @@ def train_model_regression_from_shards(
     train_files = shard_files[:-n_valid] if n_valid else shard_files
     valid_files = shard_files[-n_valid:] if n_valid else []
 
-    def train_iterator_fn():
-        return shard_batch_iterator(train_files, bs)
+    if resident_data:
+        train_iterator_fn = resident_shard_iter_fn(train_files, bs, device)
+        resident_valid_fn = resident_shard_iter_fn(valid_files, bs, device) if valid_files else None
 
-    def validation_iterator_fn():
-        if valid_files:
-            return shard_batch_iterator(valid_files, bs)
-        return None
+        def validation_iterator_fn():
+            return resident_valid_fn() if resident_valid_fn else None
+    else:
+        def train_iterator_fn():
+            return shard_batch_iterator(train_files, bs)
+
+        def validation_iterator_fn():
+            if valid_files:
+                return shard_batch_iterator(valid_files, bs)
+            return None
 
     # Get feature columns from schema
     numerical_feature_cols = schema.get('numerical_feature_cols', [])
@@ -3401,6 +3443,7 @@ def train_model_from_shards(
     save_model: bool = True,
     early_stop_patience: int = 0,
     class_weights: Optional[List[float]] = None,
+    resident_data: bool = False,
 ):
     """
     Train model from shards using schema parameters.
@@ -3419,6 +3462,8 @@ def train_model_from_shards(
     - weight_decay: L2 regularization (auto-adjusted: 1e-4 for regression, 1e-5 for classification)
     - verbose: Print training progress
     - save_model: Save trained model to disk
+    - resident_data: Load every shard onto the device once instead of
+      re-reading shards each epoch; all shards must fit in device memory.
     """
     model_type = schema.get('model_type') or ('classification' if 'class_to_idx' in schema else 'regression')
     if model_type == 'regression':
@@ -3435,6 +3480,7 @@ def train_model_from_shards(
             verbose=verbose,
             save_model=save_model,
             early_stop_patience=early_stop_patience,
+            resident_data=resident_data,
         )
     else:
         # Auto-adjust parameters for classification
@@ -3456,6 +3502,7 @@ def train_model_from_shards(
             save_model=save_model,
             early_stop_patience=early_stop_patience,
             class_weights=class_weights,
+            resident_data=resident_data,
         )
 
 
@@ -3533,7 +3580,10 @@ def train_classification_from_iterator(
 
     model.train()
     for epoch in range(epochs):
-        total_loss, total_count, correct = 0.0, 0, 0
+        # Device-side sums: per-batch .item() forces a host sync every step.
+        loss_sum = torch.zeros((), dtype=torch.float32, device=device_t)
+        correct_sum = torch.zeros((), dtype=torch.int64, device=device_t)
+        total_count = 0
         batch_num = 0
         epoch_start = time.time()
         for xb, yb in train_iterator_fn():
@@ -3564,13 +3614,12 @@ def train_classification_from_iterator(
                 loss.backward()
                 opt.step()
             batch = yb.size(0)
-            total_loss += loss.item() * batch
             total_count += batch
             with torch.no_grad():
-                preds = torch.argmax(logits, dim=-1)
-                correct += (preds == yb).sum().item()
-        train_loss = total_loss / max(1, total_count)
-        train_acc = correct / max(1, total_count)
+                loss_sum += loss.detach().float() * batch
+                correct_sum += (torch.argmax(logits, dim=-1) == yb).sum()
+        train_loss = float(loss_sum.item()) / max(1, total_count)
+        train_acc = int(correct_sum.item()) / max(1, total_count)
         epoch_dur = time.time() - epoch_start
 
         # Always run per-epoch validation when val iterator is available so early stopping works.
@@ -3672,6 +3721,7 @@ def train_model_classification_from_shards(
     save_model: bool = True,
     early_stop_patience: int = 0,
     class_weights: Optional[List[float]] = None,
+    resident_data: bool = False,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     """
     Train a classifier from shard files created by create_torch_shards.
@@ -3680,6 +3730,8 @@ def train_model_classification_from_shards(
     
     Args:
         seed: Optional random seed for reproducible training results.
+        resident_data: Load every shard onto the device once (all must fit in
+            device memory) instead of re-reading shards each epoch.
     """
     saved_models_path = pathlib.Path(schema.get('saved_models_path', '.'))
     model_name = schema.get('model_name')
@@ -3746,8 +3798,27 @@ def train_model_classification_from_shards(
                     xb_full = xb
                 yield xb_full, yb
 
-    train_iterator_fn = lambda: _iter(train_files)
-    val_iterator_fn = (lambda: _iter(valid_files)) if valid_files else None
+    def _resident_iter_fn(files: List[pathlib.Path]):
+        device_t = torch.device(device if device != 'cpu' and torch.cuda.is_available() else 'cpu')
+        shards = []
+        for f in files:
+            X_cont, X_cat, y = load_shard_data(f)
+            if X_cat is not None and X_cat.numel() > 0:
+                X_cont = torch.cat([X_cont, X_cat.float()], dim=1)
+            shards.append((X_cont.to(device_t), y.to(torch.long).to(device_t)))
+
+        def _fn():
+            for X_full, y in shards:
+                for i in range(0, X_full.shape[0], bs):
+                    yield X_full[i:i+bs], y[i:i+bs]
+        return _fn
+
+    if resident_data:
+        train_iterator_fn = _resident_iter_fn(train_files)
+        val_iterator_fn = _resident_iter_fn(valid_files) if valid_files else None
+    else:
+        train_iterator_fn = lambda: _iter(train_files)
+        val_iterator_fn = (lambda: _iter(valid_files)) if valid_files else None
 
     stats = train_classification_from_iterator(
         train_iterator_fn=train_iterator_fn,

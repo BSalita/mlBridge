@@ -1,3 +1,4 @@
+import functools
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -338,6 +339,7 @@ def BoardNumberToiVul(bn):
 def BoardNumberToVul(bn):
     return iVulToVul_d[BoardNumberToiVul(bn)]
 
+@functools.lru_cache(maxsize=1 << 18)
 def PbnToN(bd):
     """Rotate a PBN deal so the first hand is North.
 
@@ -736,6 +738,7 @@ def _lancelot_trick_score_magnitude(ns_score: str, ew_score: str) -> int | None:
     return None
 
 
+@functools.lru_cache(maxsize=4096)
 def _lancelot_signed_ns_score(ns_score: str, ew_score: str) -> int | None:
     """Signed NS trick score from which Lancelot score column is populated.
 
@@ -764,6 +767,7 @@ def _lancelot_signed_ns_score(ns_score: str, ew_score: str) -> int | None:
     return None
 
 
+@functools.lru_cache(maxsize=256)
 def _lancelot_contract_result(result: str) -> int | None:
     """Convert a Lancelot contract result; a lone dash means no Bridgemate result."""
     value = (result or '').strip()
@@ -926,7 +930,21 @@ def convert_ffdf_lancelot_to_mldf(ffdf):
     #assert df['Pair_Number_NS'].is_not_null().all()
     #assert df['Pair_Number_EW'].is_not_null().all()
 
+    # Every play of a board carries the same field frequencies.
+    expanded_by_key: dict[tuple, list] = {}
+
     def _expand_scores(x):
+        key = (
+            tuple(x['Scores_List_NS'] or ()),
+            tuple(x['Scores_List_EW'] or ()),
+            tuple(x['Score_Freq_List'] or ()),
+        )
+        cached = expanded_by_key.get(key)
+        if cached is None:
+            cached = expanded_by_key[key] = _expand_scores_uncached(x)
+        return cached
+
+    def _expand_scores_uncached(x):
         # substitute None for adjusted scores (begin with %); PASSE/passe are French pass-outs.
         # Populated nsScore/ewScore = side that received positive trick points.
         expanded = []

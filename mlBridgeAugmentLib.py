@@ -35,8 +35,9 @@ import time
 
 import endplay # for __version__
 from endplay.parsers import pbn, lin, json
-from endplay.types import Deal, Contract, Denom, Player, Penalty, Vul
+from endplay.types import Card, Deal, Contract, Denom, Player, Penalty, Rank, Vul
 from endplay.dds import calc_dd_table, calc_all_tables, par
+from numpy.random import RandomState
 from endplay.dds.ddtable import DDTable as _DDTable
 from endplay._dds import ddTableResults as _ddTableResults
 from endplay.dealer import generate_deals
@@ -1594,6 +1595,53 @@ def deal_generation_constraints(deal: Deal) -> bool:
     return True
 
 
+_RANK_ORDER = {rank: order for order, rank in enumerate(reversed(Rank))}
+_SUIT_ORDER = {suit: order for order, suit in enumerate(Denom.suits())}
+
+
+def generate_unconstrained_deal_pbns(predeal: Deal, produce: int, seed: int) -> list[str]:
+    """PBN strings of ``endplay.dealer.generate_deals(deal_generation_constraints,
+    predeal=predeal, swapping=0, produce=produce, seed=seed)``.
+
+    Same RandomState, card list, and shuffle calls as endplay, so a process
+    gets the same deals. generate_deals builds a new constraint parser on every
+    call, and Deal.to_pbn walks ranks in Python; both cost more than the DD solve.
+    """
+    rs = RandomState(seed)
+    all_cards = set(Card(suit=denom, rank=rank) for denom in Denom.suits() for rank in Rank)
+    cards = list(all_cards.difference(predeal.to_hand()))
+    split = [sum([13 - len(hand) for _, hand in predeal][:i]) for i in range(5)]
+    fixed = [str(predeal[player]) if len(predeal[player]) else None for player in Player]
+    keys = {card: (_SUIT_ORDER[card.suit], _RANK_ORDER[card.rank]) for card in cards}
+    abbr = {card: card.rank.abbr for card in cards}
+    pbns = []
+    for _ in range(produce):
+        rs.shuffle(cards)
+        hands = []
+        for index in range(4):
+            if fixed[index] is not None:
+                hands.append(fixed[index])
+                continue
+            suits = [[], [], [], []]
+            for card in sorted(cards[split[index] : split[index + 1]], key=keys.__getitem__):
+                suits[keys[card][0]].append(abbr[card])
+            hands.append(".".join("".join(suit) for suit in suits))
+        pbns.append("N:" + " ".join(hands))
+    return pbns
+
+
+def solve_dd_for_pbns(pbns: list[str], batch_size: int = 1000) -> list[Any]:
+    """DD tables for PBN strings, in order. Skips the Deal round trip ddss does not need."""
+    if not pbns:
+        return []
+    if not _DDSS_AVAILABLE:
+        return solve_dd_for_deals([Deal(pbn) for pbn in pbns])
+    tables = []
+    for start in range(0, len(pbns), batch_size):
+        tables.extend(_dds_ddss.calc_all_tables_pbnx(pbns[start : start + batch_size]))
+    return tables
+
+
 def generate_single_dummy_deals(predeal_string: str, produce: int, env: Dict[str, Any] = dict(), max_attempts: int = 1000000, seed: int = 42, show_progress: bool = True, strict: bool = True, swapping: int = 0) -> Tuple[Tuple[Deal, ...], list[Any]]:
     """Generate deals for single-dummy simulation given a predeal string.
 
@@ -1851,25 +1899,13 @@ def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.Da
                     s[0] = '...'
                     s[2] = '...'
                 predeal_string = 'N:' + ' '.join(s)
-                predeal = Deal(predeal_string)
-                deals_t = generate_deals(
-                    deal_generation_constraints,
-                    predeal=predeal,
-                    swapping=0,
-                    show_progress=False,
-                    produce=sd_productions,
-                    seed=42,
-                    max_attempts=1000000,
-                    env={},
-                    strict=True,
-                )
-                deals = tuple(deals_t)
+                deals = generate_unconstrained_deal_pbns(Deal(predeal_string), sd_productions, seed=42)
                 start_idx = len(all_deals)
                 all_deals.extend(deals)
                 deal_groups.append((pbn, ns_ew, start_idx, len(deals), deals))
 
         # --- Phase 2: solve ALL deals in one large batch ---
-        all_tables = solve_dd_for_deals(all_deals)
+        all_tables = solve_dd_for_pbns(all_deals)
 
         # --- Phase 3: regroup results and build probability tables ---
         sd_tricks_schema = {'SD_Deal': pl.String}
@@ -1881,7 +1917,7 @@ def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.Da
 
             data_rows = []
             for sddeal, t in zip(deals, tables):
-                row = [sddeal.to_pbn()]
+                row = [sddeal]
                 row.extend([val for dd_col in t.to_list() for val in dd_col])
                 data_rows.append(row)
 

@@ -337,10 +337,17 @@ def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, 
     if matches.height == 0:
         return None
     if matches.height > 1:
-        ids = matches["lancelot_person_id"].to_list()
+        choices = []
+        for row in matches.to_dicts():
+            prefix = next(
+                kind
+                for kind in ("lancelot", "classic", "license")
+                if normalize_identifier(row.get(IDENTIFIER_COLUMNS[kind]) or "-") == value
+            )
+            choices.append(f"{prefix}:{value} = {row.get('display_name')}")
         raise ValueError(
-            f"Player identifier {identifier!r} is ambiguous across Lancelot IDs {ids}; "
-            "use an explicit license:, classic:, or lancelot: prefix."
+            f"Player identifier {identifier!r} is ambiguous; "
+            f"pass one of: {'; '.join(sorted(choices))}."
         )
     return matches.to_dicts()[0]
 

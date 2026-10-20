@@ -241,6 +241,18 @@ def contract_declarer(contract: str) -> str:
     return "NULL" if contract == "PASS" else contract[-1]
 
 
+def contract_bucket(contract: str) -> int:
+    """0 pass-out, 1 part-score, 2 game, 3 slam."""
+    if contract == "PASS":
+        return 0
+    level, strain = int(contract[0]), contract[1]
+    if level >= 6:
+        return 3
+    if level >= 5 or (level == 4 and strain in "HS") or (level >= 3 and strain == "N"):
+        return 2
+    return 1
+
+
 # ACBL contract accuracy drops at full declarer weight; 0.3 keeps it level
 # and still raises declarer accuracy (chosen on half of a 2026 test sample).
 ACBL_DECLARER_WEIGHT = 0.3
@@ -261,6 +273,12 @@ def joint_contract_and_declarer(
     A declarer model trained only on played boards (ACBL) has no ``NULL``
     class; a pass-out then gets the uniform seat probability, the factor a
     declarer model with no opinion would give every contract.
+
+    The pass-out, part-score, game, or slam bucket with the most total score
+    is chosen first, then the best contract inside it. Pass-out and game
+    probability sits on a few classes while part-score probability is spread
+    over many, so a plain argmax over-predicts game and pass-out (2026 test
+    sample: ACBL club 54% predicted game against 44% played).
     Probability arrays are rows x classes in schema class order.
     """
     contract_probs = np.asarray(contract_probs, dtype=np.float64)
@@ -281,6 +299,10 @@ def joint_contract_and_declarer(
     seat = np.array([direction_index[contract_declarer(name)] for name in contract_classes])
     with np.errstate(divide="ignore"):
         score = np.log(contract_probs) + declarer_weight * np.log(direction_probs[:, seat])
-    best = score.argmax(axis=1)
+    weight = np.exp(score - score.max(axis=1, keepdims=True))
+    bucket = np.array([contract_bucket(name) for name in contract_classes])
+    mass = np.stack([weight[:, bucket == b].sum(axis=1) for b in range(4)], axis=1)
+    in_bucket = bucket[None, :] == mass.argmax(axis=1)[:, None]
+    best = np.where(in_bucket, score, -np.inf).argmax(axis=1)
     contracts = [contract_classes[index] for index in best]
     return contracts, [contract_declarer(name) for name in contracts]

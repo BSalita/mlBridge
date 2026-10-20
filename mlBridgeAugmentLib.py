@@ -3821,12 +3821,13 @@ def _global_stdev_seed(df_sorted: pl.DataFrame, col: str) -> float:
 def pair_key_expr(a: str, b: str) -> pl.Expr:
     """Partnership key 'low-high' of two player-id columns, compared as strings.
 
-    Null unless both ids are known: a player without an id must not form a pair with themself.
+    Null unless both ids are known and differ: min/max would otherwise pair a known player with
+    themself when the partner has no id, and ACBL has a few rows with one number on both seats.
     """
     x = pl.col(a).cast(pl.Utf8)
     y = pl.col(b).cast(pl.Utf8)
     return (
-        pl.when(x.is_null() | y.is_null())
+        pl.when(x.is_null() | y.is_null() | (x == y))
         .then(pl.lit(None, dtype=pl.Utf8))
         .otherwise(pl.concat_str([pl.min_horizontal(x, y), pl.lit("-"), pl.max_horizontal(x, y)]))
     )

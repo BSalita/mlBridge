@@ -3818,6 +3818,40 @@ def _global_stdev_seed(df_sorted: pl.DataFrame, col: str) -> float:
     return float(v)
 
 
+def pair_key_expr(a: str, b: str) -> pl.Expr:
+    """Partnership key 'low-high' of two player-id columns, compared as strings.
+
+    Null unless both ids are known: a player without an id must not form a pair with themself.
+    """
+    x = pl.col(a).cast(pl.Utf8)
+    y = pl.col(b).cast(pl.Utf8)
+    return (
+        pl.when(x.is_null() | y.is_null())
+        .then(pl.lit(None, dtype=pl.Utf8))
+        .otherwise(pl.concat_str([pl.min_horizontal(x, y), pl.lit("-"), pl.max_horizontal(x, y)]))
+    )
+
+
+def _reset_unrated_slot(
+    index: Dict[Any, int],
+    ratings: np.ndarray,
+    boards_played: np.ndarray,
+    sessions: list,
+    initial_rating: float,
+) -> None:
+    """Keep the null-id slot at the initial rating with no boards or sessions.
+
+    Players without an id (e.g. ACBL guests) share that slot. It still feeds the
+    partnership and field averages, but it never learns and is never reported.
+    """
+    slot = index.get(None)
+    if slot is None:
+        return
+    ratings[slot] = initial_rating
+    boards_played[slot] = 0
+    sessions[slot] = set()
+
+
 def compute_pair_matchpoint_elo_ratings(
     df_sorted: pl.DataFrame,
     *,
@@ -3943,28 +3977,8 @@ def compute_pair_matchpoint_elo_ratings(
     )
     if has_player_ids:
         df_sorted = df_sorted.with_columns(
-            _Pair_ID_NS=pl.concat_str([
-                pl.min_horizontal(
-                    pl.col("Player_ID_N").cast(pl.Utf8),
-                    pl.col("Player_ID_S").cast(pl.Utf8),
-                ),
-                pl.lit("-"),
-                pl.max_horizontal(
-                    pl.col("Player_ID_N").cast(pl.Utf8),
-                    pl.col("Player_ID_S").cast(pl.Utf8),
-                ),
-            ]),
-            _Pair_ID_EW=pl.concat_str([
-                pl.min_horizontal(
-                    pl.col("Player_ID_E").cast(pl.Utf8),
-                    pl.col("Player_ID_W").cast(pl.Utf8),
-                ),
-                pl.lit("-"),
-                pl.max_horizontal(
-                    pl.col("Player_ID_E").cast(pl.Utf8),
-                    pl.col("Player_ID_W").cast(pl.Utf8),
-                ),
-            ]),
+            _Pair_ID_NS=pair_key_expr("Player_ID_N", "Player_ID_S"),
+            _Pair_ID_EW=pair_key_expr("Player_ID_E", "Player_ID_W"),
         )
         ns_pair_col, ew_pair_col = "_Pair_ID_NS", "_Pair_ID_EW"
         _added_temp_pair_cols = True
@@ -3986,8 +4000,8 @@ def compute_pair_matchpoint_elo_ratings(
         _added_temp_pair_cols = False
 
     n_rows = df_sorted.height
-    ns_pairs = df_sorted[ns_pair_col].to_numpy()
-    ew_pairs = df_sorted[ew_pair_col].to_numpy()
+    ns_pairs = df_sorted[ns_pair_col].to_list()
+    ew_pairs = df_sorted[ew_pair_col].to_list()
     pct_ns = df_sorted["Pct_NS"].to_numpy()
     session_ids = df_sorted["session_id"].to_numpy()
 
@@ -4236,6 +4250,8 @@ def compute_pair_matchpoint_elo_ratings(
             boards_played_ew[idx] += bcount_ew[idx]
             if bcount_ew[idx] > 0:
                 sessions_ew[idx].add(session_id_value)
+        _reset_unrated_slot(ns_index, ratings_ns, boards_played_ns, sessions_ns, initial_rating)
+        _reset_unrated_slot(ew_index, ratings_ew, boards_played_ew, sessions_ew, initial_rating)
 
         # Second pass over the session's rows to write After / Elo_N / Delta_After
         # using the now-committed ratings. r_ns_after for each row is the pair's
@@ -4357,10 +4373,10 @@ def compute_player_matchpoint_elo_ratings(
         raise ValueError(f"Missing columns: {missing}")
 
     n_rows = df_sorted.height
-    pid_n_arr = df_sorted["Player_ID_N"].to_numpy()
-    pid_s_arr = df_sorted["Player_ID_S"].to_numpy()
-    pid_e_arr = df_sorted["Player_ID_E"].to_numpy()
-    pid_w_arr = df_sorted["Player_ID_W"].to_numpy()
+    pid_n_arr = df_sorted["Player_ID_N"].to_list()
+    pid_s_arr = df_sorted["Player_ID_S"].to_list()
+    pid_e_arr = df_sorted["Player_ID_E"].to_list()
+    pid_w_arr = df_sorted["Player_ID_W"].to_list()
     pct_ns = df_sorted["Pct_NS"].to_numpy()
     session_ids = df_sorted["session_id"].to_numpy()
 
@@ -4613,6 +4629,8 @@ def compute_player_matchpoint_elo_ratings(
             boards_played_ew[idx] += bcount_ew[idx]
             if bcount_ew[idx] > 0:
                 sessions_ew[idx].add(session_id_value)
+        _reset_unrated_slot(idx_ns_map, ratings_ns, boards_played_ns, sessions_ns, initial_rating)
+        _reset_unrated_slot(idx_ew_map, ratings_ew, boards_played_ew, sessions_ew, initial_rating)
 
         # Second pass to record post-commit After / counts / Delta_Before.
         for i_int in (int(x) for x in rows):

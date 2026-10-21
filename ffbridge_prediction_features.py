@@ -306,3 +306,51 @@ def joint_contract_and_declarer(
     best = np.where(in_bucket, score, -np.inf).argmax(axis=1)
     contracts = [contract_classes[index] for index in best]
     return contracts, [contract_declarer(name) for name in contracts]
+
+
+ROOM_COUNT_COLUMNS = ("Board_Tables", "Contract_Pred_Tables", "Declarer_Direction_Pred_Tables")
+
+
+def _seat(contract: pl.Expr, declarer: str) -> pl.Expr:
+    return pl.when(contract == "PASS").then(pl.lit("NULL")).otherwise(pl.col(declarer).cast(pl.Utf8))
+
+
+def attach_room_counts(frame: pl.DataFrame, deal: tuple[str, ...]) -> pl.DataFrame:
+    """How many tables played this row's predicted contract and seat.
+
+    ``deal`` is the columns naming one deal: ``("Board",)`` for one room,
+    ``("Board", "PBN")`` when a frame can hold games with different deals
+    under one board number. ``Board_Tables`` is the tables with a contract on
+    the deal. ``Contract_Pred_Tables`` is the tables whose contract, doubles
+    included, is this row's ``Contract_Pred``. ``Declarer_Direction_Pred_Tables``
+    is the tables declared from ``Declarer_Direction_Pred``; a predicted
+    pass-out counts the passed-out tables, whether its predicted seat is
+    ``NULL`` (FFBridge) or null (ACBL). Both counts are null when the row has
+    no prediction.
+    """
+    keys = list(deal)
+    contract = pl.col("Contract").cast(pl.Utf8)
+    predicted = pl.col("Contract_Pred").cast(pl.Utf8)
+    played = frame.select(
+        *keys,
+        contract.alias("_contract"),
+        _seat(contract, "Declarer_Direction").alias("_seat"),
+    )
+    out = frame.drop(ROOM_COUNT_COLUMNS, strict=False).with_columns(
+        contract.is_not_null().sum().over(keys).cast(pl.Int32).alias("Board_Tables"),
+        predicted.alias("_contract"),
+        _seat(predicted, "Declarer_Direction_Pred").alias("_seat"),
+    )
+    for key, count_column in (
+        ("_contract", "Contract_Pred_Tables"),
+        ("_seat", "Declarer_Direction_Pred_Tables"),
+    ):
+        counts = (
+            played.filter(pl.col(key).is_not_null())
+            .group_by(*keys, key)
+            .agg(pl.len().cast(pl.Int32).alias(count_column))
+        )
+        out = out.join(counts, on=[*keys, key], how="left", maintain_order="left").with_columns(
+            pl.when(pl.col(key).is_not_null()).then(pl.col(count_column).fill_null(0)).alias(count_column)
+        )
+    return out.drop("_contract", "_seat")

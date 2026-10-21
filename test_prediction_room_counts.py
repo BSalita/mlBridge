@@ -22,6 +22,10 @@ class RoomCountTests(unittest.TestCase):
         # The doubled 4SXW is a different contract from 4SW, but the same seat.
         self.assertEqual(counted["Contract_Pred_Tables"].to_list(), [2, 2, 1, 2, None, 1, 1])
         self.assertEqual(counted["Declarer_Direction_Pred_Tables"].to_list(), [3, 3, 1, 3, None, 1, 1])
+        self.assertEqual(
+            counted["Pred_Not_Played_In_Room"].to_list(),
+            [False, False, False, False, None, False, False],
+        )
         self.assertEqual(attach_room_counts(counted, ("Board",)).columns, counted.columns)
 
     def test_a_null_predicted_seat_on_a_pass_out_counts_the_passed_out_tables(self) -> None:
@@ -52,6 +56,20 @@ class RoomCountTests(unittest.TestCase):
         counted = attach_room_counts(boards, ("Board", "PBN"))
         self.assertEqual(counted["Board_Tables"].to_list(), [2, 2, 1])
         self.assertEqual(counted["Contract_Pred_Tables"].to_list(), [2, 2, 1])
+
+    def test_flags_a_predicted_contract_nobody_played(self) -> None:
+        boards = pl.DataFrame(
+            {
+                "Board": [5, 5],
+                "Contract": ["3NN", "4SS"],
+                "Declarer_Direction": ["N", "S"],
+                "Contract_Pred": ["2SN", "3NN"],
+                "Declarer_Direction_Pred": ["N", "N"],
+            }
+        )
+        counted = attach_room_counts(boards, ("Board",))
+        self.assertEqual(counted["Contract_Pred_Tables"].to_list(), [0, 1])
+        self.assertEqual(counted["Pred_Not_Played_In_Room"].to_list(), [True, False])
 
 
 if __name__ == "__main__":

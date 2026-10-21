@@ -256,6 +256,15 @@ def contract_bucket(contract: str) -> int:
 # ACBL contract accuracy drops at full declarer weight; 0.3 keeps it level
 # and still raises declarer accuracy (chosen on half of a 2026 test sample).
 ACBL_DECLARER_WEIGHT = 0.3
+# FFBridge keeps the declarer model at full weight.
+FFBRIDGE_DECLARER_WEIGHT = 1.0
+# Not stored in the checkpoint. model_version stays the newest checkpoint
+# time when this rule changes. bucket_then_contract sums probability inside
+# pass-out, part-score, game, and slam, picks that bucket, then the best
+# contract inside it. A plain argmax stays on one game contract (4H at every
+# table) even when part-score, spread over many classes, is more likely, and
+# the winning part-score then differs by table.
+CONTRACT_SELECTION = "bucket_then_contract"
 
 
 def joint_contract_and_declarer(
@@ -263,7 +272,7 @@ def joint_contract_and_declarer(
     contract_probs: np.ndarray,
     direction_classes: list[str],
     direction_probs: np.ndarray,
-    declarer_weight: float = 1.0,
+    declarer_weight: float = FFBRIDGE_DECLARER_WEIGHT,
 ) -> tuple[list[str], list[str]]:
     """One contract and its declarer from both models' probabilities.
 
@@ -326,7 +335,11 @@ def attach_room_counts(frame: pl.DataFrame, deal: tuple[str, ...]) -> pl.DataFra
     is the tables declared from ``Declarer_Direction_Pred``; a predicted
     pass-out counts the passed-out tables, whether its predicted seat is
     ``NULL`` (FFBridge) or null (ACBL). Both counts are null when the row has
-    no prediction.
+    no prediction. ``Pred_Not_Played_In_Room`` is true when the predicted
+    contract was played at no table. The pick comes from the pairs' strength
+    before this room's bids are known, and it can differ by table, so the
+    chosen contract can be one nobody played. A double is a different
+    contract from the undoubled one.
     """
     keys = list(deal)
     contract = pl.col("Contract").cast(pl.Utf8)
@@ -336,7 +349,7 @@ def attach_room_counts(frame: pl.DataFrame, deal: tuple[str, ...]) -> pl.DataFra
         contract.alias("_contract"),
         _seat(contract, "Declarer_Direction").alias("_seat"),
     )
-    out = frame.drop(ROOM_COUNT_COLUMNS, strict=False).with_columns(
+    out = frame.drop([*ROOM_COUNT_COLUMNS, "Pred_Not_Played_In_Room"], strict=False).with_columns(
         contract.is_not_null().sum().over(keys).cast(pl.Int32).alias("Board_Tables"),
         predicted.alias("_contract"),
         _seat(predicted, "Declarer_Direction_Pred").alias("_seat"),
@@ -353,4 +366,10 @@ def attach_room_counts(frame: pl.DataFrame, deal: tuple[str, ...]) -> pl.DataFra
         out = out.join(counts, on=[*keys, key], how="left", maintain_order="left").with_columns(
             pl.when(pl.col(key).is_not_null()).then(pl.col(count_column).fill_null(0)).alias(count_column)
         )
-    return out.drop("_contract", "_seat")
+    return out.drop("_contract", "_seat").with_columns(
+        pl.when(pl.col("Contract_Pred").is_null())
+        .then(None)
+        .otherwise(pl.col("Contract_Pred_Tables") == 0)
+        .cast(pl.Boolean)
+        .alias("Pred_Not_Played_In_Room")
+    )

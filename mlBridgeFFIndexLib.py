@@ -305,12 +305,10 @@ def lookup_persons_by_name(
     return [item[2] for item in ranked[:limit]]
 
 
-def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, Any]]:
-    """Resolve a bare or ``kind:value`` identifier, failing on collisions."""
+def _split_identifier(identifier: str) -> tuple[Optional[str], str]:
     raw = str(identifier or "").strip()
     if not raw:
         raise ValueError("player identifier is required")
-
     kind = None
     value = raw
     if ":" in raw:
@@ -322,8 +320,12 @@ def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, 
                 f"{sorted(IDENTIFIER_COLUMNS)}."
             )
         value = candidate
-    value = normalize_identifier(value)
+    return kind, normalize_identifier(value)
 
+
+def lookup_person_matches(persons: pl.DataFrame, identifier: str) -> pl.DataFrame:
+    """Every person a bare or ``kind:value`` identifier hits. Empty if none."""
+    kind, value = _split_identifier(identifier)
     columns = (
         [IDENTIFIER_COLUMNS[kind]]
         if kind is not None
@@ -333,10 +335,16 @@ def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, 
     for column in columns:
         candidate = _clean_string(column) == value
         predicate = candidate if predicate is None else predicate | candidate
-    matches = persons.filter(predicate).unique(subset=["lancelot_person_id"])
+    return persons.filter(predicate).unique(subset=["lancelot_person_id"])
+
+
+def lookup_person(persons: pl.DataFrame, identifier: str) -> Optional[dict[str, Any]]:
+    """Resolve a bare or ``kind:value`` identifier, failing on collisions."""
+    matches = lookup_person_matches(persons, identifier)
     if matches.height == 0:
         return None
     if matches.height > 1:
+        _kind, value = _split_identifier(identifier)
         choices = []
         for row in matches.to_dicts():
             prefix = next(

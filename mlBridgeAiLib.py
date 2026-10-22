@@ -4125,7 +4125,8 @@ def predict_regression_model(saved_models_path: pathlib.Path, model_name: str, d
             if missing_codes:
                 feature_column_list = feature_column_list + missing_codes
         # Reorder DataFrame columns to match training feature order strictly
-        missing = [c for c in feature_column_list if c not in test_subset_df.columns]
+        present = set(test_subset_df.columns)
+        missing = [c for c in feature_column_list if c not in present]
         if missing:
             raise ValueError(f"Inference DataFrame missing required features: {missing[:10]}{'...' if len(missing)>10 else ''}")
         # Select in exact order
@@ -4594,7 +4595,8 @@ def predict_classification_model(
             missing_codes = [m.get('code_col') for m in code_mappings if m.get('code_col') and m.get('code_col') not in feature_column_list]
             if missing_codes:
                 feature_column_list = feature_column_list + missing_codes
-        missing = [c for c in feature_column_list if c not in test_subset_df.columns]
+        present = set(test_subset_df.columns)
+        missing = [c for c in feature_column_list if c not in present]
         if missing:
             raise ValueError(f"Inference DataFrame missing required features: {missing[:10]}{'...' if len(missing)>10 else ''}")
         test_subset_df = test_subset_df.select(feature_column_list)
@@ -4626,8 +4628,11 @@ def predict_classification_model(
     # DEBUG: Check actual DataFrame columns vs what we're trying to select
     print(f"   DEBUG: test_subset_df has {len(test_subset_df.columns)} columns")
     print(f"   DEBUG: Attempting to select {len(numerical_feature_cols)} numerical columns")
-    numerical_in_df = [c for c in numerical_feature_cols if c in test_subset_df.columns]
-    numerical_missing = [c for c in numerical_feature_cols if c not in test_subset_df.columns]
+    # One set: df.columns rebuilds a list of every name on each call, and the
+    # ACBL classifiers have thousands of features (2 s per call before).
+    present = set(test_subset_df.columns)
+    numerical_in_df = [c for c in numerical_feature_cols if c in present]
+    numerical_missing = [c for c in numerical_feature_cols if c not in present]
     if numerical_missing:
         print(f"   DEBUG: Missing numerical columns: {numerical_missing[:10]}")
     print(f"   DEBUG: Found {len(numerical_in_df)} numerical columns in DataFrame")

@@ -231,7 +231,7 @@ class PostmortemBase(ABC):
                 st.info("Data is loading... Please wait for processing to complete.")
                 return None
 
-            result_df = cast_numeric_display_columns(con.execute(query).pl())
+            result_df = cast_numeric_display_columns(con.sql(query).pl())
             st.text(f"Result is a dataframe of {len(result_df)} rows.")
             
             # Import streamlitlib for display

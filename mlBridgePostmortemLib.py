@@ -25,6 +25,49 @@ from mlBridge.mlBridgeLib import cast_numeric_display_columns
 from mlBridge.postmortem_section_help import section_help_for_players, section_waits_on_row_click
 
 
+def scroll_to_report_top_once() -> None:
+    """After a new report is written, scroll its top into view.
+
+    A report button (Full, Brief, Predictions) or a new game rewrites the
+    report top to bottom, and the browser was left at the bottom. Any
+    widget click reruns the app and redraws the whole report, so the page
+    scrolls only when the request changes: the session, player, or report
+    button. The script sits in a components.html iframe; Streamlit keeps an
+    iframe whose HTML is unchanged across reruns, so it runs once per
+    request. Call it after the report's last element.
+    """
+    import streamlit.components.v1 as components
+
+    request = (
+        str(st.session_state.get("session_id")),
+        str(st.session_state.get("player_id")),
+        str(st.session_state.get("button_title")),
+    )
+    if st.session_state.get("_report_scroll_request") != request:
+        st.session_state._report_scroll_request = request
+        st.session_state._report_scroll_count = st.session_state.get("_report_scroll_count", 0) + 1
+    count = st.session_state._report_scroll_count
+    components.html(
+        f"""<script>
+// report request {count}
+(function () {{
+  const doc = window.parent.document;
+  let tries = 0;
+  const go = () => {{
+    const top = doc.querySelector('a[name="top-of-report"], #top-of-report');
+    if (top) {{
+      top.scrollIntoView({{ block: "start" }});
+      return;
+    }}
+    if (++tries < 50) setTimeout(go, 100);
+  }};
+  go();
+}})();
+</script>""",
+        height=0,
+    )
+
+
 def git_build_stamp(path: pathlib.Path) -> str:
     """Git commit time of path, not Docker/checkout mtime."""
     path = pathlib.Path(path).resolve()
@@ -666,6 +709,7 @@ class PostmortemBase(ABC):
                     </a>
                 </div>
             ''', unsafe_allow_html=True)
+            scroll_to_report_top_once()
 
         # PDF download button
         if hasattr(st.session_state, 'pdf_link') and st.session_state.pdf_link:

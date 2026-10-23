@@ -51,15 +51,21 @@ def scroll_to_report_top_once() -> None:
         f"""<script>
 // report request {count}
 (function () {{
-  const doc = window.parent.document;
-  let tries = 0;
+  // Grids finish loading after this runs and can move the page: keep
+  // aligning for a few seconds, and stop as soon as the user scrolls,
+  // clicks, or types.
+  const win = window.parent;
+  const doc = win.document;
+  const started = Date.now();
+  let stopped = false;
+  for (const type of ["wheel", "touchstart", "keydown", "mousedown"]) {{
+    win.addEventListener(type, () => {{ stopped = true; }}, {{ once: true, passive: true }});
+  }}
   const go = () => {{
+    if (stopped) return;
     const top = doc.querySelector('a[name="top-of-report"], #top-of-report');
-    if (top) {{
-      top.scrollIntoView({{ block: "start" }});
-      return;
-    }}
-    if (++tries < 50) setTimeout(go, 100);
+    if (top) top.scrollIntoView({{ block: "start" }});
+    if (Date.now() - started < 20000) setTimeout(go, 200);
   }};
   go();
 }})();

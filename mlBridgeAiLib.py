@@ -92,6 +92,7 @@
 import polars as pl
 import pathlib
 import gc
+import math
 from collections import defaultdict
 from enum import Enum
 import time
@@ -218,7 +219,8 @@ def train_one_epoch(
     y_range: Optional[Tuple[float, float]],
     scaler,
     use_amp: bool,
-    grad_clip: Optional[float] = 1.0
+    grad_clip: Optional[float] = 1.0,
+    scheduler: Optional[Any] = None,
 ) -> Tuple[float, int]:
     model.train()
     # Loss and counts stay on the device: a per-batch .item() or boolean index
@@ -255,6 +257,8 @@ def train_one_epoch(
             if grad_clip is not None:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
             optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         loss_sum += loss.detach().float() * n_valid
         count_sum += n_valid
     return float(loss_sum.item()), int(count_sum.item())
@@ -483,6 +487,88 @@ def resident_shard_iter_fn(files: List[pathlib.Path], batch_size: int, device: s
         for X_cont, X_cat, y in shards:
             yield from iterate_batches(X_cont, X_cat, y, batch_size)
     return _fn
+
+
+def resident_shuffled_iter_fn(
+    files: List[Any],
+    batch_size: int,
+    device: str,
+    seed: Optional[int],
+    combine_cat: bool,
+) -> Tuple[Callable[[], Any], int]:
+    """
+    Purpose:
+        Put every shard on the device as one tensor; each call of the returned
+        function yields mini-batches in a new random row order. Rows within a
+        shard are in file order (often grouped by session), so unshuffled
+        batches are correlated.
+
+    Args:
+        files: Shard paths or in-memory shards. All rows must fit in device memory.
+        batch_size: Rows per batch.
+        device: Training device string.
+        seed: Seed for the row order (None = 0).
+        combine_cat: True yields (x, y) with X_cat appended to X_cont as float
+            (classifier input); False yields (x_cont, x_cat, y) (regression MLP).
+
+    Returns:
+        (iterator function, number of rows)
+    """
+    device_t = torch.device(device if device != 'cpu' and torch.cuda.is_available() else 'cpu')
+    loaded = [load_shard_data(f) for f in files]
+    # Concatenate on the host so the device holds one copy, not shards plus a copy.
+    X_cont = torch.cat([part[0] for part in loaded])
+    has_cat = all(part[1] is not None and part[1].numel() > 0 for part in loaded)
+    X_cat = torch.cat([part[1] for part in loaded]) if has_cat else None
+    y = torch.cat([part[2] for part in loaded])
+    del loaded
+    if combine_cat:
+        if X_cat is not None:
+            X_cont = torch.cat([X_cont, X_cat.float()], dim=1)
+        X_cat = None
+        y = y.to(torch.long)
+    X_cont = X_cont.to(device_t)
+    X_cat = X_cat.to(device_t) if X_cat is not None else None
+    y = y.to(device_t)
+    n = X_cont.shape[0]
+    generator = torch.Generator(device=device_t)
+    generator.manual_seed(0 if seed is None else seed)
+
+    def _fn():
+        order = torch.randperm(n, device=device_t, generator=generator)
+        for i in range(0, n, batch_size):
+            idx = order[i:i + batch_size]
+            if combine_cat:
+                yield X_cont[idx], y[idx]
+            else:
+                yield X_cont[idx], (X_cat[idx] if X_cat is not None else None), y[idx]
+    return _fn, n
+
+
+def make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    lr_schedule: Optional[str],
+    lr: float,
+    epochs: int,
+    steps_per_epoch: Optional[int],
+) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
+    """Per-batch learning-rate schedule, or None for a constant rate.
+
+    'onecycle': warm up to ``lr`` over the first 30% of steps, then anneal
+    toward zero by the last epoch. Early stopping ends it sooner.
+    """
+    if lr_schedule is None:
+        return None
+    if lr_schedule != 'onecycle':
+        raise ValueError(f"Unknown lr_schedule {lr_schedule!r}; expected None or 'onecycle'")
+    if not steps_per_epoch:
+        raise ValueError("lr_schedule='onecycle' needs steps_per_epoch")
+    return torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=epochs * steps_per_epoch,
+        pct_start=0.3,
+    )
 
 
 def resolve_model_path(saved_models_path: pathlib.Path, model_name: str) -> pathlib.Path:
@@ -2012,10 +2098,13 @@ def _train_model_core(
     cat_feature_info: Optional[Dict[str, int]] = None,
     save_model: bool = True,
     early_stop_patience: int = 0,
+    lr_schedule: Optional[str] = None,
+    steps_per_epoch: Optional[int] = None,
 ) -> Tuple[Any, pathlib.Path, Dict[str, Any]]:
     """
     Purpose:
         Shared training core used by both df-based and shard-based trainers.
+        lr_schedule / steps_per_epoch: see make_lr_scheduler.
 
     Args:
         train_iterator_fn: Function returning training iterator of (xb, yb).
@@ -2058,6 +2147,7 @@ def _train_model_core(
         opt = torch.optim.SGD(model.parameters(), lr=lr, weight_decay=weight_decay, momentum=0.9)
     else:
         opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = make_lr_scheduler(opt, lr_schedule, lr, epochs, steps_per_epoch)
     loss_fn = torch.nn.MSELoss()
 
     if verbose:
@@ -2080,7 +2170,9 @@ def _train_model_core(
     for epoch in range(epochs):
         epoch_start = time.time()
         train_iter = train_iterator_fn()
-        tloss, tcount = train_one_epoch(model, train_iter, loss_fn, opt, device_t, y_range, scaler, use_amp)
+        tloss, tcount = train_one_epoch(
+            model, train_iter, loss_fn, opt, device_t, y_range, scaler, use_amp, scheduler=scheduler
+        )
         train_loss = tloss / max(1, tcount)
         train_samples_total = tcount
 
@@ -3376,7 +3468,11 @@ def train_model_regression_from_shards(
     early_stop_patience: int = 0,
     resident_data: bool = False,
     shards: Optional[List[Dict[str, Any]]] = None,
+    shuffle: bool = False,
+    lr_schedule: Optional[str] = None,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
+    if (shuffle or lr_schedule) and not resident_data:
+        raise ValueError("shuffle and lr_schedule need resident_data=True")
     # Validate schema and target
     y_name = schema.get('target_column')
     if not y_name:
@@ -3424,8 +3520,18 @@ def train_model_regression_from_shards(
     train_files = shard_files[:-n_valid] if n_valid else shard_files
     valid_files = shard_files[-n_valid:] if n_valid else []
 
+    steps_per_epoch: Optional[int] = None
     if resident_data:
-        train_iterator_fn = resident_shard_iter_fn(train_files, bs, device)
+        if shuffle:
+            train_iterator_fn, train_rows = resident_shuffled_iter_fn(
+                train_files, bs, device, seed, combine_cat=False
+            )
+        else:
+            train_iterator_fn = resident_shard_iter_fn(train_files, bs, device)
+            train_rows = (
+                sum(int(load_shard_data(f)[2].shape[0]) for f in train_files) if lr_schedule else 0
+            )
+        steps_per_epoch = math.ceil(train_rows / bs) if train_rows else None
         resident_valid_fn = resident_shard_iter_fn(valid_files, bs, device) if valid_files else None
 
         def validation_iterator_fn():
@@ -3467,6 +3573,8 @@ def train_model_regression_from_shards(
         cat_feature_info=cat_feature_info,
         save_model=save_model,
         early_stop_patience=early_stop_patience,
+        lr_schedule=lr_schedule,
+        steps_per_epoch=steps_per_epoch,
     )
 
 
@@ -3487,6 +3595,8 @@ def train_model_from_shards(
     class_weights: Optional[List[float]] = None,
     resident_data: bool = False,
     shards: Optional[List[Dict[str, Any]]] = None,
+    shuffle: bool = False,
+    lr_schedule: Optional[str] = None,
 ):
     """
     Train model from shards using schema parameters.
@@ -3510,6 +3620,10 @@ def train_model_from_shards(
       re-reading shards each epoch; all shards must fit in device memory.
     - shards: In-memory shards from build_torch_shards, used instead of the
       shard files in schema['saved_models_path'].
+    - shuffle: New random row order every epoch. Off by default: shards keep
+      file order, which groups rows by session. Needs resident_data.
+    - lr_schedule: None (constant lr) or 'onecycle' (warm up to lr, then
+      anneal). Needs resident_data.
     """
     model_type = schema.get('model_type') or ('classification' if 'class_to_idx' in schema else 'regression')
     if model_type == 'regression':
@@ -3528,6 +3642,8 @@ def train_model_from_shards(
             early_stop_patience=early_stop_patience,
             resident_data=resident_data,
             shards=shards,
+            shuffle=shuffle,
+            lr_schedule=lr_schedule,
         )
     else:
         return train_model_classification_from_shards(
@@ -3546,6 +3662,8 @@ def train_model_from_shards(
             class_weights=class_weights,
             resident_data=resident_data,
             shards=shards,
+            shuffle=shuffle,
+            lr_schedule=lr_schedule,
         )
 
 
@@ -3565,12 +3683,15 @@ def train_classification_from_iterator(
     verbose: bool = False,
     early_stop_patience: int = 0,
     class_weights: Optional[List[float]] = None,
+    lr_schedule: Optional[str] = None,
+    steps_per_epoch: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Train a classification model using iterator functions for data loading.
-    
+
     Args:
         seed: Optional random seed for reproducible training results.
+        lr_schedule / steps_per_epoch: see make_lr_scheduler.
     """
     device_t = torch.device(device if torch.cuda.is_available() and device == 'cuda' else 'cpu')
     
@@ -3599,6 +3720,7 @@ def train_classification_from_iterator(
             print(f"[GPU] Initial memory: {torch.cuda.memory_allocated()/1e9:.2f} GB")
     
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = make_lr_scheduler(opt, lr_schedule, lr, epochs, steps_per_epoch)
     if class_weights is not None and len(class_weights) == num_classes:
         cw_tensor = torch.tensor(class_weights, dtype=torch.float32, device=device_t)
         loss_fn = torch.nn.CrossEntropyLoss(weight=cw_tensor)
@@ -3656,6 +3778,8 @@ def train_classification_from_iterator(
             else:
                 loss.backward()
                 opt.step()
+            if scheduler is not None:
+                scheduler.step()
             batch = yb.size(0)
             total_count += batch
             with torch.no_grad():
@@ -3766,6 +3890,8 @@ def train_model_classification_from_shards(
     class_weights: Optional[List[float]] = None,
     resident_data: bool = False,
     shards: Optional[List[Dict[str, Any]]] = None,
+    shuffle: bool = False,
+    lr_schedule: Optional[str] = None,
 ) -> Tuple[Any, Optional[pathlib.Path], Dict[str, Any]]:
     """
     Train a classifier from shard files created by create_torch_shards.
@@ -3777,7 +3903,11 @@ def train_model_classification_from_shards(
         resident_data: Load every shard onto the device once (all must fit in
             device memory) instead of re-reading shards each epoch.
         shards: In-memory shards from build_torch_shards, used instead of files.
+        shuffle: New random row order every epoch (needs resident_data).
+        lr_schedule: None or 'onecycle' (needs resident_data); see make_lr_scheduler.
     """
+    if (shuffle or lr_schedule) and not resident_data:
+        raise ValueError("shuffle and lr_schedule need resident_data=True")
     saved_models_path = pathlib.Path(schema.get('saved_models_path', '.'))
     model_name = schema.get('model_name')
     if not model_name:
@@ -3858,8 +3988,18 @@ def train_model_classification_from_shards(
                     yield X_full[i:i+bs], y[i:i+bs]
         return _fn
 
+    steps_per_epoch: Optional[int] = None
     if resident_data:
-        train_iterator_fn = _resident_iter_fn(train_files)
+        if shuffle:
+            train_iterator_fn, train_rows = resident_shuffled_iter_fn(
+                train_files, bs, device, seed, combine_cat=True
+            )
+        else:
+            train_iterator_fn = _resident_iter_fn(train_files)
+            train_rows = (
+                sum(int(load_shard_data(f)[2].shape[0]) for f in train_files) if lr_schedule else 0
+            )
+        steps_per_epoch = math.ceil(train_rows / bs) if train_rows else None
         val_iterator_fn = _resident_iter_fn(valid_files) if valid_files else None
     else:
         train_iterator_fn = lambda: _iter(train_files)
@@ -3881,6 +4021,8 @@ def train_model_classification_from_shards(
         verbose=verbose,
         early_stop_patience=early_stop_patience,
         class_weights=class_weights,
+        lr_schedule=lr_schedule,
+        steps_per_epoch=steps_per_epoch,
     )
 
     # Save model if requested

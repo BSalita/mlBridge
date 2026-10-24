@@ -2692,12 +2692,11 @@ def add_dd_tricks_column(df: pl.DataFrame) -> pl.DataFrame:
     - 'DD_Tricks': Predicted tricks the declarer can take in their contract strain
     """
     return df.with_columns(
-        pl.struct(['Declarer_Direction', 'BidSuit', pl.col('^DD_[NESW]_[CDHSN]$')])
-        .map_elements(
-            lambda r: None if r['Declarer_Direction'] is None else r[f"DD_{r['Declarer_Direction']}_{r['BidSuit']}"],
-            return_dtype=pl.UInt8
-        )
-        .alias('DD_Tricks')
+        _pick_column_by_key(
+            ['Declarer_Direction', 'BidSuit'],
+            {(d, s): f"DD_{d}_{s}" for d in 'NESW' for s in 'CDHSN'},
+            pl.UInt8,
+        ).alias('DD_Tricks')
     )
 
 
@@ -2724,12 +2723,11 @@ def add_dd_tricks_dummy_column(df: pl.DataFrame) -> pl.DataFrame:
     - 'DD_Tricks_Dummy': Predicted tricks the dummy can take in the contract strain
     """
     return df.with_columns(
-        pl.struct(['Dummy_Direction', 'BidSuit', pl.col('^DD_[NESW]_[CDHSN]$')])
-        .map_elements(
-            lambda r: None if r['Dummy_Direction'] is None else r[f"DD_{r['Dummy_Direction']}_{r['BidSuit']}"],
-            return_dtype=pl.UInt8
-        )
-        .alias('DD_Tricks_Dummy')
+        _pick_column_by_key(
+            ['Dummy_Direction', 'BidSuit'],
+            {(d, s): f"DD_{d}_{s}" for d in 'NESW' for s in 'CDHSN'},
+            pl.UInt8,
+        ).alias('DD_Tricks_Dummy')
     )
 
 
@@ -3430,6 +3428,60 @@ def derive_tricks_from_contract(df: pl.DataFrame) -> pl.DataFrame:
     return compute_expected_tricks(df)
 
 
+def _dd_score_lookup_expr(scores_d: Dict, level: int, strain: str, tricks_col: str, vul_col: str) -> pl.Expr:
+    """Vectorized scores_d.get((level, strain, tricks, vul)) as an Int16 expression."""
+    nv_map = {t: s for (lvl, strn, t, v), s in scores_d.items() if lvl == level and strn == strain and not v}
+    v_map = {t: s for (lvl, strn, t, v), s in scores_d.items() if lvl == level and strn == strain and v}
+    tricks = pl.col(tricks_col).cast(pl.Int64)
+    vul = pl.col(vul_col).cast(pl.Boolean)
+    return (
+        pl.when(vul).then(tricks.replace_strict(v_map, default=None, return_dtype=pl.Int16))
+        .when(~vul).then(tricks.replace_strict(nv_map, default=None, return_dtype=pl.Int16))
+        .otherwise(None)
+        .cast(pl.Int16)
+    )
+
+
+def _pick_column_by_key(key_cols: List[str], col_by_key: Dict[tuple, str], dtype: pl.DataType) -> pl.Expr:
+    """Per row, return the column named by col_by_key[(key values)], else null.
+
+    Vectorized replacement for struct(...).map_elements(lambda r: r[f"..."]).
+    Keys are compared as strings, so Categorical/Enum/String/int key columns
+    all work.
+    """
+    keys = [pl.col(c).cast(pl.String) for c in key_cols]
+    branches = [
+        pl.when(pl.all_horizontal([k == str(v) for k, v in zip(keys, key_vals)])).then(pl.col(col))
+        for key_vals, col in col_by_key.items()
+    ]
+    return pl.coalesce(branches).cast(dtype)
+
+
+def _contract_score_lookup_expr(all_scores_d: Dict, lvl_col: str, suit_col: str, tricks_col: str, vul_col: str, dbl_col: str) -> pl.Expr:
+    """Vectorized all_scores_d.get((BidLvl, BidSuit, Tricks, Vul, Dbl)) as Int16.
+
+    Matches the dict lookup: any null part gives null, except all five null
+    (passed out), which scores 0.
+    """
+    def _key(lvl, suit, tricks, vul, dbl):
+        return f"{lvl}|{suit}|{tricks}|{'true' if vul else 'false'}|{dbl}"
+    score_by_key = {_key(*k): s for k, s in all_scores_d.items() if None not in k}
+    parts = [
+        pl.col(lvl_col).cast(pl.Int64, strict=False).cast(pl.String),
+        pl.col(suit_col).cast(pl.String),
+        pl.col(tricks_col).cast(pl.Int64, strict=False).cast(pl.String),
+        pl.col(vul_col).cast(pl.Boolean, strict=False).cast(pl.String),
+        pl.col(dbl_col).cast(pl.String),
+    ]
+    all_null = pl.all_horizontal([pl.col(c).is_null() for c in (lvl_col, suit_col, tricks_col, vul_col, dbl_col)])
+    passed_out_score = all_scores_d.get((None, None, None, None, None))
+    return (
+        pl.when(all_null).then(pl.lit(passed_out_score))
+        .otherwise(pl.concat_str(parts, separator='|').replace_strict(score_by_key, default=None, return_dtype=pl.Int16))
+        .cast(pl.Int16)
+    )
+
+
 def add_dd_scores_basic(df: pl.DataFrame, scores_d: Dict) -> pl.DataFrame:
     """Create basic DD_Score columns for all possible contracts (no contract-dependent columns).
     
@@ -3463,13 +3515,11 @@ def add_dd_scores_basic(df: pl.DataFrame, scores_d: Dict) -> pl.DataFrame:
     - `DD_Score_[CDHSN]_[NESW]_Max`: Maximum double dummy score for each strain/direction combo
     """
     # Create scores for columns: DD_Score_[1-7][CDHSN]_[NESW]
+    # Vectorized lookup (was 140 per-row Python map_elements calls). Same
+    # semantics as scores_d.get((level, strain, tricks, vul)): null tricks,
+    # null vul, or tricks outside the table give null.
     df = df.with_columns([
-        pl.struct([f"DD_{direction}_{strain}", f"Vul_{pair_direction}"])
-        .map_elements(
-            lambda r, lvl=level, strn=strain, dir=direction, pdir=pair_direction: 
-                scores_d.get((lvl, strn, r[f"DD_{dir}_{strn}"], r[f"Vul_{pdir}"]), None),
-            return_dtype=pl.Int16
-        )
+        _dd_score_lookup_expr(scores_d, level, strain, f"DD_{direction}_{strain}", f"Vul_{pair_direction}")
         .alias(f"DD_Score_{level}{strain}_{direction}")
         for level in range(1, 8)
         for strain in CDHSN
@@ -3541,12 +3591,11 @@ def add_dd_scores_contract_dependent(df: pl.DataFrame) -> pl.DataFrame:
     
     # Create DD_Score_Declarer by selecting the DD_Score_[1-7][CDHSN]_[NESW] column for the given level, strain, and Declarer_Direction
     df = df.with_columns([
-        pl.struct(['BidLvl', 'BidSuit', 'Declarer_Direction'] + dd_score_columns)
-        .map_elements(
-            lambda r: None if r['Declarer_Direction'] is None else r[f"DD_Score_{r['BidLvl']}{r['BidSuit']}_{r['Declarer_Direction']}"],
-            return_dtype=pl.Int16
-        )
-        .alias('DD_Score_Declarer')
+        _pick_column_by_key(
+            ['BidLvl', 'BidSuit', 'Declarer_Direction'],
+            {(lvl, s, d): f"DD_Score_{lvl}{s}_{d}" for lvl in range(1, 8) for s in 'CDHSN' for d in 'NESW'},
+            pl.Int16,
+        ).alias('DD_Score_Declarer')
     ])
 
     # Create list of column names of declarer: DD_Score_[CDHSN]_[NESW]_Max
@@ -3556,13 +3605,12 @@ def add_dd_scores_contract_dependent(df: pl.DataFrame) -> pl.DataFrame:
     
     # Create DD_Score_Max_Declarer by selecting the DD_Score_[CDHSN]_[NESW]_Max column for the given strain and declarer direction
     df = df.with_columns([
-        pl.struct(['BidSuit', 'Declarer_Direction'] + dd_score_columns_max)
-        .map_elements(
-            lambda r: None if r['Declarer_Direction'] is None else r[f"DD_Score_{r['BidSuit']}_{r['Declarer_Direction']}_Max"],
-            return_dtype=pl.Int16
-        )
-        .alias('DD_Score_Max_Declarer')
-    ])    
+        _pick_column_by_key(
+            ['BidSuit', 'Declarer_Direction'],
+            {(s, d): f"DD_Score_{s}_{d}_Max" for s in 'CDHSN' for d in 'NESW'},
+            pl.Int16,
+        ).alias('DD_Score_Max_Declarer')
+    ])
 
     # todo:? this is all wrong. probably should be the maximum score that the defenders could have achieved if they had made a further bid.
     # # Create list of column names of defender: DD_Score_[CDHSN]_[NESW]_Max
@@ -5294,9 +5342,12 @@ def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
         ])
         .with_columns([
             pl.concat_str([pl.lit('EV'), pl.col('Declarer_Pair_Direction'), pl.col('Declarer_Direction'), pl.col('BidSuit'), pl.col('BidLvl').cast(pl.String), pl.when(pl.col('Vul_Declarer')).then(pl.lit('V')).otherwise(pl.lit('NV'))], separator='_').alias('EV_Score_Col_Declarer'),
-            pl.struct(['Contract','Declarer_Pair_Direction', 'Score_NS', 'Score_EW']).map_elements(
-                lambda r: 0 if r['Contract'] == 'PASS' else (None if r['Declarer_Pair_Direction'] is None else r[f"Score_{r['Declarer_Pair_Direction']}"]), return_dtype=pl.Int16
-            ).alias('Score_Declarer'),
+            pl.when(pl.col('Contract').cast(pl.String).eq('PASS')).then(pl.lit(0))
+            .when(pl.col('Declarer_Pair_Direction').cast(pl.String).eq('NS')).then(pl.col('Score_NS'))
+            .when(pl.col('Declarer_Pair_Direction').cast(pl.String).eq('EW')).then(pl.col('Score_EW'))
+            .otherwise(None)
+            .cast(pl.Int16)
+            .alias('Score_Declarer'),
             pl.when(pl.col('Declarer_Pair_Direction').eq(pl.lit('NS')))
             .then(pl.col('Par_NS'))
             .when(pl.col('Declarer_Pair_Direction').eq(pl.lit('EW')))
@@ -5317,18 +5368,15 @@ def add_position_role_info(df: pl.DataFrame) -> pl.DataFrame:
             .then(pl.lit(1, dtype=pl.Int8))
             .otherwise(pl.lit(-1, dtype=pl.Int8))
             .alias('Par_Contract_EW'),
-            pl.struct(['BidSuit', 'ParContracts']).map_elements(
-                lambda r: (
-                    None
-                    if r['BidSuit'] is None or r['ParContracts'] is None
-                    else any(
-                        contract is not None
-                        and contract.get('Strain') == r['BidSuit']
-                        for contract in r['ParContracts']
-                    )
-                ),
-                return_dtype=pl.Boolean,
-            ).alias('Is_Par_Suit'),
+            pl.when(pl.col('BidSuit').is_null() | pl.col('ParContracts').is_null())
+            .then(None)
+            .otherwise(
+                pl.col('ParContracts')
+                .list.eval(pl.element().struct.field('Strain').cast(pl.String))
+                .list.contains(pl.col('BidSuit').cast(pl.String))
+            )
+            .cast(pl.Boolean)
+            .alias('Is_Par_Suit'),
             pl.col('Par_Declarer').lt(0).alias('Is_Sacrifice_Opportunity'),
             (
                 pl.col('DD_Score_Declarer').eq(pl.col('Par_Declarer'))
@@ -5440,17 +5488,15 @@ def add_declarer_scores(df: pl.DataFrame) -> pl.DataFrame:
     - DataFrame with added declarer scoring columns
     """
     all_scores_d, _, _ = precompute_contract_score_tables()
-    # NOTE: This block intentionally uses struct.map_elements for dynamic column selection.
-    # Todo: replace with a pure-Polars approach (mask-based or index-based take) to remove Python row-wise code.
+    # Vectorized (was two per-row Python map_elements over 70M+ rows).
     df = df.with_columns([
-        pl.when(pl.col('EV_Score_Col_Declarer').is_null()).then(None).otherwise(
-            pl.struct(['EV_Score_Col_Declarer'] + EV_SCORE_COLUMNS
-            ).map_elements(lambda x: x[x['EV_Score_Col_Declarer']] if x['EV_Score_Col_Declarer'] is not None else None, return_dtype=pl.Float64)
+        _pick_column_by_key(
+            ['EV_Score_Col_Declarer'],
+            {(c,): c for c in EV_SCORE_COLUMNS},
+            pl.Float64,
         ).cast(pl.Float32).alias('EV_Score_Declarer'),
-        # NOTE: This block intentionally uses a Python dict lookup for score computation.
-        # Todo: replace with a Polars-native lookup/join on (BidLvl,BidSuit,Tricks,Vul_Declarer,Dbl) for performance.
-        pl.struct(['BidLvl', 'BidSuit', 'Tricks', 'Vul_Declarer', 'Dbl']).map_elements(
-            lambda x: all_scores_d.get(tuple(x.values()), None), return_dtype=pl.Int16
+        _contract_score_lookup_expr(
+            all_scores_d, 'BidLvl', 'BidSuit', 'Tricks', 'Vul_Declarer', 'Dbl'
         ).alias('Computed_Score_Declarer'),
         pl.lit(None).alias('Computed_Score_Declarer2'),
     ])
@@ -6792,9 +6838,9 @@ def add_score_calculations(df: pl.DataFrame) -> pl.DataFrame:
         else:
             all_scores_d, _, _ = precompute_contract_score_tables()
             out = out.with_columns(
-                pl.struct(['BidLvl', 'BidSuit', 'Tricks', 'Vul_Declarer', 'Dbl'])
-                .map_elements(lambda x: all_scores_d.get(tuple(x.values()), None), return_dtype=pl.Int16)
-                .alias('Score')
+                _contract_score_lookup_expr(
+                    all_scores_d, 'BidLvl', 'BidSuit', 'Tricks', 'Vul_Declarer', 'Dbl'
+                ).alias('Score')
             )
 
     if 'Score_NS' not in out.columns:

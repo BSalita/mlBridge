@@ -440,6 +440,93 @@ def load_shard_data(shard_file: Union[pathlib.Path, Dict[str, Any]]) -> Tuple[to
     return X_cont_t, X_cat_t, y_t
 
 
+# Read the next shard file on a background thread while the current one
+# trains. Set MLBRIDGE_SHARD_PREFETCH=0 to load in the foreground.
+SHARD_PREFETCH = __import__('os').environ.get('MLBRIDGE_SHARD_PREFETCH', '1') != '0'
+
+
+def _host_buffer_like(t: torch.Tensor) -> torch.Tensor:
+    # numpy memory: torch's CPU allocator (mimalloc on Windows) keeps memory
+    # that a thread other than the allocating one frees, so a shard read on
+    # the prefetch thread and freed by the trainer never went back (RSS grew
+    # one shard per shard).
+    try:
+        np_dtype = torch.empty(0, dtype=t.dtype).numpy().dtype
+    except (TypeError, RuntimeError):
+        return torch.empty(t.shape, dtype=t.dtype)
+    return torch.from_numpy(np.empty(tuple(t.shape), dtype=np_dtype))
+
+
+def _read_shard_data(shard: pathlib.Path):
+    # Same tensors as load_shard_data(shard), read through a memory map into
+    # fresh buffers. A memory-mapped file counts as commit (not RAM) until
+    # the copy finishes.
+    try:
+        src = load_shard_data(torch.load(shard, map_location='cpu', mmap=True))
+    except RuntimeError:
+        return load_shard_data(shard)  # not a zip-format file
+    out = []
+    for t in src:
+        if t is None:
+            out.append(None)
+        else:
+            out.append(_host_buffer_like(t))
+            out[-1].copy_(t)
+    return tuple(out)
+
+
+def iter_shard_data(files: List[Union[pathlib.Path, Dict[str, Any]]]):
+    """
+    Yield load_shard_data(f) for each shard in order. With SHARD_PREFETCH, the
+    next shard is read on a thread while the caller uses the current one; at
+    most two shards are in memory, since shard i + 2 is read only after the
+    caller drops shard i.
+    """
+    if not SHARD_PREFETCH or any(isinstance(f, dict) for f in files):
+        for f in files:
+            yield load_shard_data(f)
+        return
+    if len(files) < 2:
+        # Same buffers as the threaded path, so the allocator does not keep
+        # a freed shard cached beside them.
+        for f in files:
+            yield _read_shard_data(f)
+        return
+
+    import weakref
+    from concurrent.futures import ThreadPoolExecutor
+
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='shard-prefetch')
+    jobs = {}
+    state = {'next': 0, 'closed': False}
+
+    def _schedule():
+        # Also runs from a finalizer, so it only queues work.
+        i = state['next']
+        if state['closed'] or i >= len(files):
+            return
+        state['next'] = i + 1
+        jobs[i] = pool.submit(_read_shard_data, files[i])
+
+    try:
+        _schedule()
+        for i in range(len(files)):
+            data = jobs.pop(i).result()
+            if i == 0:
+                _schedule()
+            anchor = next((t for t in data if t is not None), None)
+            if anchor is None:
+                _schedule()
+            else:
+                weakref.finalize(anchor, _schedule)
+            yield data
+            del data, anchor
+    finally:
+        state['closed'] = True
+        pool.shutdown(wait=True)
+        jobs.clear()
+
+
 def shard_batch_iterator(files: List[pathlib.Path], batch_size: int):
     """
     Purpose:
@@ -455,8 +542,7 @@ def shard_batch_iterator(files: List[pathlib.Path], batch_size: int):
           - xb_cat:  torch.LongTensor [B, K] or None
           - yb:      torch.FloatTensor [B] or torch.LongTensor [B]
     """
-    for f in files:
-        X_cont, X_cat, y = load_shard_data(f)
+    for X_cont, X_cat, y in iter_shard_data(files):
         for xb_cont, xb_cat, yb in iterate_batches(X_cont, X_cat, y, batch_size):
             yield xb_cont, xb_cat, yb
 
@@ -3515,6 +3601,7 @@ def train_model_regression_from_shards(
     sample_payload = _shard_payload(shard_files[0])
     Xc_sample: torch.Tensor = sample_payload.get('X_cont', torch.empty(0))
     input_dim = int(Xc_sample.shape[1]) if Xc_sample.ndim == 2 else 0
+    del sample_payload, Xc_sample  # don't hold a whole shard through training
 
     n_valid = 1 if valid_pct > 0 and len(shard_files) > 1 else 0
     train_files = shard_files[:-n_valid] if n_valid else shard_files
@@ -3951,6 +4038,7 @@ def train_model_classification_from_shards(
     if y_sample.numel() == 0:
         raise RuntimeError("Sample shard missing 'y' for classification")
     num_classes = int(y_sample.max().item()) + 1
+    del sample_payload, Xc_sample, Xk_sample, y_sample  # don't hold a whole shard through training
 
     # Train/val split by shards
     n_valid = 1 if valid_pct > 0 and len(shard_files) > 1 else 0
@@ -3958,8 +4046,7 @@ def train_model_classification_from_shards(
     valid_files = shard_files[-n_valid:] if n_valid else []
 
     def _iter(files: List[pathlib.Path]):
-        for f in files:
-            X_cont, X_cat, y = load_shard_data(f)
+        for X_cont, X_cat, y in iter_shard_data(files):
             # For classification, y should be Long
             if y.dtype != torch.long:
                 y = y.to(torch.long)

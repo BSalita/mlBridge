@@ -31,6 +31,7 @@ import warnings
 from collections import defaultdict
 from typing import Optional, Union, Callable, Type, Dict, List, Tuple, Any
 import time
+import threading
 
 
 import endplay # for __version__
@@ -3703,7 +3704,6 @@ def add_direction_summaries(df: pl.DataFrame) -> pl.DataFrame:
     
     return df
 
-# todo: gpt5 suggested: Optional: JIT the loop with numba for 10–100x speedup on large datasets.
 # -------------------------------
 # Elo rating: stratum-mixed field K-dampening
 # -------------------------------
@@ -3784,11 +3784,13 @@ def _event_mp_limit_scale_array(df_sorted: pl.DataFrame, n_rows: int) -> np.ndar
     """Per-row event-MP-limit K scales; ones if ``strata_bucket`` is absent."""
     if "strata_bucket" not in df_sorted.columns or n_rows == 0:
         return np.ones(n_rows, dtype=np.float32)
-    buckets = df_sorted.get_column("strata_bucket").to_list()
-    return np.asarray(
-        [_event_mp_limit_k_scale(b) for b in buckets],
-        dtype=np.float32,
-    )
+    buckets = df_sorted.get_column("strata_bucket")
+    # One lookup per distinct bucket, then broadcast to rows.
+    keys = buckets.drop_nulls().unique()
+    vals = pl.Series([_event_mp_limit_k_scale(b) for b in keys.to_list()], dtype=pl.Float32)
+    out = buckets.replace_strict(keys, vals, return_dtype=pl.Float32)
+    out = out.fill_null(_event_mp_limit_k_scale(None))
+    return out.to_numpy().astype(np.float32, copy=False)
 
 
 def _stratum_scale(ratio: float) -> float:
@@ -3887,24 +3889,594 @@ def pair_key_expr(a: str, b: str) -> pl.Expr:
     )
 
 
-def _reset_unrated_slot(
-    index: Dict[Any, int],
-    ratings: np.ndarray,
-    boards_played: np.ndarray,
-    sessions: list,
-    initial_rating: float,
-) -> None:
-    """Keep the null-id slot at the initial rating with no boards or sessions.
+# -------------------------------
+# Elo kernels (numba when installed, plain Python otherwise)
+# -------------------------------
+# The per-session loops of the pair and player Elo functions. They run on
+# dense integer ids and must give the same numbers as the older dict-based
+# loops, so the float32/float64 steps are written out explicitly:
+# - ratings, snapshots, field sums and stdevs are float32 (the field sum
+#   uses numpy's pairwise float32 summation order);
+# - expected scores, K factors and session deltas are float64;
+# - a session delta is rounded to float32 before it is added to the rating.
+# _elo_ensure_jit() swaps these names for numba-compiled versions on first
+# use, so importing this module does not import numba.
 
-    Players without an id (e.g. ACBL guests) share that slot. It still feeds the
-    partnership and field averages, but it never learns and is never reported.
+
+def _elo_block_sum_f32(a, start, n):
+    """numpy's float32 sum of a block of n <= 128 values (8 accumulators)."""
+    if n < 8:
+        res = np.float32(0.0)
+        for i in range(start, start + n):
+            res += a[i]
+        return res
+    r0 = a[start]
+    r1 = a[start + 1]
+    r2 = a[start + 2]
+    r3 = a[start + 3]
+    r4 = a[start + 4]
+    r5 = a[start + 5]
+    r6 = a[start + 6]
+    r7 = a[start + 7]
+    i = 8
+    lim = n - (n % 8)
+    while i < lim:
+        j = start + i
+        r0 += a[j]
+        r1 += a[j + 1]
+        r2 += a[j + 2]
+        r3 += a[j + 3]
+        r4 += a[j + 4]
+        r5 += a[j + 5]
+        r6 += a[j + 6]
+        r7 += a[j + 7]
+        i += 8
+    res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7))
+    while i < n:
+        res += a[start + i]
+        i += 1
+    return res
+
+
+def _elo_pairwise_sum_f32(a, start, n):
+    """float32 sum of a[start:start+n] in the same order as numpy's a.sum().
+
+    numpy splits n > 128 into halves (left size a multiple of 8) and adds
+    the two partial sums. Done with an explicit stack: numba cannot cache
+    recursive functions.
     """
-    slot = index.get(None)
-    if slot is None:
-        return
-    ratings[slot] = initial_rating
-    boards_played[slot] = 0
-    sessions[slot] = set()
+    if n <= 128:
+        return _elo_block_sum_f32(a, start, n)
+    st_start = np.empty(256, dtype=np.int64)
+    st_n = np.empty(256, dtype=np.int64)
+    st_done = np.empty(256, dtype=np.int64)
+    vals = np.empty(256, dtype=np.float32)
+    top = 0
+    nv = 0
+    st_start[0] = start
+    st_n[0] = n
+    st_done[0] = 0
+    top = 1
+    while top > 0:
+        top -= 1
+        s = st_start[top]
+        m = st_n[top]
+        if m <= 128:
+            vals[nv] = _elo_block_sum_f32(a, s, m)
+            nv += 1
+        elif st_done[top] == 0:
+            m2 = m // 2
+            m2 -= m2 % 8
+            st_done[top] = 1
+            top += 1
+            st_start[top] = s + m2
+            st_n[top] = m - m2
+            st_done[top] = 0
+            top += 1
+            st_start[top] = s
+            st_n[top] = m2
+            st_done[top] = 0
+            top += 1
+        else:
+            right = vals[nv - 1]
+            left = vals[nv - 2]
+            nv -= 2
+            vals[nv] = left + right
+            nv += 1
+    return vals[0]
+
+
+def _elo_stratum_scale_k(ratio, low, high, k_min):
+    """Same as _stratum_scale, with the anchors passed in."""
+    if not np.isfinite(ratio) or ratio <= low:
+        return 1.0
+    if ratio >= high:
+        return k_min
+    return 1.0 - (ratio - low) / (high - low) * (1.0 - k_min)
+
+
+def _elo_field_strength_scale_k(z, z_full, z_floor, k_min):
+    """Same as _field_strength_scale, with the anchors passed in."""
+    if np.isnan(z):
+        return 1.0
+    if z >= z_full:
+        return 1.0
+    if z <= z_floor:
+        return k_min
+    return k_min + (1.0 - k_min) * (z - z_floor) / (z_full - z_floor)
+
+
+def _elo_board_field(buf, n, tmp, initial_rating, global_stdev, anchors):
+    """Field sum, mean, stdev and the two K-dampening scales for one board."""
+    total = np.float64(_elo_pairwise_sum_f32(buf, 0, n))
+    if n >= 2:
+        mean = total / n
+        mean32 = np.float32(mean)
+        for k in range(n):
+            d = buf[k] - mean32
+            tmp[k] = d * d
+        stdev = np.float64(np.sqrt(_elo_pairwise_sum_f32(tmp, 0, n) / np.float32(n)))
+        stratum = _elo_stratum_scale_k(stdev / global_stdev, anchors[0], anchors[1], anchors[2])
+        z = (mean - initial_rating) / global_stdev
+        strength = _elo_field_strength_scale_k(z, anchors[3], anchors[4], anchors[5])
+    else:
+        mean = np.float64(buf[0])
+        stdev = 0.0
+        stratum = 1.0
+        strength = 1.0
+    return total, mean, stdev, stratum, strength
+
+
+def _elo_score(pct, i, skip_nan, score_amplifier):
+    """NS score for row i, or -1.0 when the row must not update ratings."""
+    s = np.float64(pct[i])
+    # The old loop only skipped NaN when Pct_NS came back as float64.
+    if skip_nan and np.isnan(s):
+        return -1.0
+    # Corrupt percentages are skipped, not clamped. NaN falls through.
+    if s < 0.0 or s > 1.0:
+        return -1.0
+    if score_amplifier != 1.0:
+        s = 0.5 + score_amplifier * (s - 0.5)
+        if s < 0.0:
+            s = 0.0
+        elif s > 1.0:
+            s = 1.0
+    return s
+
+
+def _elo_mark(idx, sess_no, mark, part, n_part, delta, bcount):
+    """Add idx to this session's participants once; returns the new count."""
+    if mark[idx] != sess_no:
+        mark[idx] = sess_no
+        part[n_part] = idx
+        delta[idx] = 0.0
+        bcount[idx] = 0
+        return n_part + 1
+    return n_part
+
+
+def _elo_commit(part, n_part, ratings, delta, bcount, boards_played, n_sessions,
+                seen, use_seen, code, n_codes, null_idx, initial_rating,
+                min_rating, max_rating):
+    """End of session: add deltas with the hard clamp, count boards and sessions."""
+    for p in range(n_part):
+        idx = part[p]
+        new_r = ratings[idx] + np.float32(delta[idx])
+        if new_r < min_rating:
+            ratings[idx] = min_rating
+        elif new_r > max_rating:
+            ratings[idx] = max_rating
+        else:
+            ratings[idx] = new_r
+        boards_played[idx] += bcount[idx]
+        if bcount[idx] > 0:
+            if use_seen:
+                key = np.int64(idx) * n_codes + code
+                if key not in seen:
+                    seen.add(key)
+                    n_sessions[idx] += 1
+            else:
+                n_sessions[idx] += 1
+    # The null-id slot never learns (see the pair function).
+    if null_idx >= 0:
+        ratings[null_idx] = initial_rating
+        boards_played[null_idx] = 0
+        n_sessions[null_idx] = 0
+
+
+def _elo_pair_kernel(
+    proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes,
+    board, ns_idx, ew_idx, pct, skip_nan, scale, emp,
+    n_ns, n_ew, null_ns, null_ew, max_len,
+    initial_rating, k_base, provisional_boost_until, elo_scale, score_amplifier,
+    min_rating, max_rating, gsd_ns, gsd_ew, anchors,
+    r_ns_before, r_ew_before, e_ns_out, e_ew_out, r_ns_after, r_ew_after,
+    n_ns_out, n_ew_out, delta_before, delta_after,
+    sd_ns_out, sd_ew_out, mean_ns_out, mean_ew_out,
+):
+    ratings_ns = np.full(n_ns, initial_rating, dtype=np.float32)
+    ratings_ew = np.full(n_ew, initial_rating, dtype=np.float32)
+    bp_ns = np.zeros(n_ns, dtype=np.int32)
+    bp_ew = np.zeros(n_ew, dtype=np.int32)
+    ns_sessions = np.zeros(n_ns, dtype=np.int32)
+    ew_sessions = np.zeros(n_ew, dtype=np.int32)
+    delta_ns = np.zeros(n_ns, dtype=np.float64)
+    delta_ew = np.zeros(n_ew, dtype=np.float64)
+    bc_ns = np.zeros(n_ns, dtype=np.int32)
+    bc_ew = np.zeros(n_ew, dtype=np.int32)
+    mark_ns = np.full(n_ns, -1, dtype=np.int64)
+    mark_ew = np.full(n_ew, -1, dtype=np.int64)
+    part_ns = np.zeros(n_ns, dtype=np.int64)
+    part_ew = np.zeros(n_ew, dtype=np.int64)
+    buf_ns = np.zeros(max_len, dtype=np.float32)
+    buf_ew = np.zeros(max_len, dtype=np.float32)
+    tmp = np.zeros(max_len, dtype=np.float32)
+    seen_ns = {np.int64(-1)}
+    seen_ew = {np.int64(-1)}
+
+    for s in range(sess_starts.shape[0]):
+        s_start = sess_starts[s]
+        s_end = sess_ends[s]
+        # Ratings do not change inside a session, so they are the snapshot.
+        np_ns = 0
+        np_ew = 0
+        for q in range(s_start, s_end):
+            i = proc_order[q]
+            np_ns = _elo_mark(ns_idx[i], s, mark_ns, part_ns, np_ns, delta_ns, bc_ns)
+            np_ew = _elo_mark(ew_idx[i], s, mark_ew, part_ew, np_ew, delta_ew, bc_ew)
+
+        b_s = s_start
+        while b_s < s_end:
+            b_e = b_s + 1
+            while b_e < s_end and board[proc_order[b_e]] == board[proc_order[b_e - 1]]:
+                b_e += 1
+            n_board = b_e - b_s
+            for off in range(n_board):
+                i = proc_order[b_s + off]
+                buf_ns[off] = ratings_ns[ns_idx[i]]
+                buf_ew[off] = ratings_ew[ew_idx[i]]
+            sum_ns, mean_ns, sd_ns, st_ns, fs_ns = _elo_board_field(buf_ns, n_board, tmp, initial_rating, gsd_ns, anchors)
+            sum_ew, mean_ew, sd_ew, st_ew, fs_ew = _elo_board_field(buf_ew, n_board, tmp, initial_rating, gsd_ew, anchors)
+
+            for off in range(n_board):
+                i = proc_order[b_s + off]
+                idx_ns = ns_idx[i]
+                idx_ew = ew_idx[i]
+                r_ns_self = np.float64(buf_ns[off])
+                r_ew_self = np.float64(buf_ew[off])
+                if n_board >= 2:
+                    field_avg_ns = (sum_ns - r_ns_self) / (n_board - 1)
+                    field_avg_ew = (sum_ew - r_ew_self) / (n_board - 1)
+                else:
+                    field_avg_ns = r_ns_self
+                    field_avg_ew = r_ew_self
+                e_ns = 1.0 / (1.0 + 10.0 ** (-(r_ns_self - field_avg_ns) / elo_scale))
+                e_ew = 1.0 / (1.0 + 10.0 ** (-(r_ew_self - field_avg_ew) / elo_scale))
+                boost_ns = 1.5 if bp_ns[idx_ns] < provisional_boost_until else 1.0
+                boost_ew = 1.5 if bp_ew[idx_ew] < provisional_boost_until else 1.0
+                sc = np.float64(scale[i])
+                em = np.float64(emp[i])
+                k_ns = k_base * boost_ns * sc * st_ns * fs_ns * em
+                k_ew = k_base * boost_ew * sc * st_ew * fs_ew * em
+
+                r_ns_before[i] = buf_ns[off]
+                r_ew_before[i] = buf_ew[off]
+                e_ns_out[i] = e_ns
+                e_ew_out[i] = e_ew
+                sd_ns_out[i] = sd_ns
+                sd_ew_out[i] = sd_ew
+                mean_ns_out[i] = mean_ns
+                mean_ew_out[i] = mean_ew
+
+                s_ns = _elo_score(pct, i, skip_nan, score_amplifier)
+                if s_ns == -1.0:
+                    continue
+                s_ew = 1.0 - s_ns
+                delta_ns[idx_ns] += k_ns * (s_ns - e_ns)
+                delta_ew[idx_ew] += k_ew * (s_ew - e_ew)
+                bc_ns[idx_ns] += 1
+                bc_ew[idx_ew] += 1
+            b_s = b_e
+
+        code = sess_codes[s]
+        _elo_commit(part_ns, np_ns, ratings_ns, delta_ns, bc_ns, bp_ns, ns_sessions,
+                    seen_ns, use_seen, code, n_codes, null_ns, initial_rating, min_rating, max_rating)
+        _elo_commit(part_ew, np_ew, ratings_ew, delta_ew, bc_ew, bp_ew, ew_sessions,
+                    seen_ew, use_seen, code, n_codes, null_ew, initial_rating, min_rating, max_rating)
+
+        for q in range(s_start, s_end):
+            i = proc_order[q]
+            r_ns_after[i] = ratings_ns[ns_idx[i]]
+            r_ew_after[i] = ratings_ew[ew_idx[i]]
+            n_ns_out[i] = ns_sessions[ns_idx[i]]
+            n_ew_out[i] = ew_sessions[ew_idx[i]]
+            delta_before[i] = r_ns_before[i] - r_ew_before[i]
+            delta_after[i] = r_ns_after[i] - r_ew_after[i]
+
+
+def _elo_player_kernel(
+    proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes,
+    board, idx_n, idx_s, idx_e, idx_w, pct, skip_nan, scale, emp,
+    n_ns, n_ew, null_ns, null_ew, max_len,
+    initial_rating, k_base, provisional_boost_until, elo_scale, score_amplifier,
+    min_rating, max_rating, gsd_ns, gsd_ew, anchors,
+    r_n_before, r_s_before, r_e_before, r_w_before, e_ns_out, e_ew_out,
+    r_n_after, r_s_after, r_e_after, r_w_after,
+    n_n_out, n_s_out, n_e_out, n_w_out,
+    sd_ns_out, sd_ew_out, mean_ns_out, mean_ew_out,
+):
+    ratings_ns = np.full(n_ns, initial_rating, dtype=np.float32)
+    ratings_ew = np.full(n_ew, initial_rating, dtype=np.float32)
+    bp_ns = np.zeros(n_ns, dtype=np.int32)
+    bp_ew = np.zeros(n_ew, dtype=np.int32)
+    ns_sessions = np.zeros(n_ns, dtype=np.int32)
+    ew_sessions = np.zeros(n_ew, dtype=np.int32)
+    delta_ns = np.zeros(n_ns, dtype=np.float64)
+    delta_ew = np.zeros(n_ew, dtype=np.float64)
+    bc_ns = np.zeros(n_ns, dtype=np.int32)
+    bc_ew = np.zeros(n_ew, dtype=np.int32)
+    mark_ns = np.full(n_ns, -1, dtype=np.int64)
+    mark_ew = np.full(n_ew, -1, dtype=np.int64)
+    part_ns = np.zeros(n_ns, dtype=np.int64)
+    part_ew = np.zeros(n_ew, dtype=np.int64)
+    buf_ns = np.zeros(max_len, dtype=np.float32)
+    buf_ew = np.zeros(max_len, dtype=np.float32)
+    tmp = np.zeros(max_len, dtype=np.float32)
+    two = np.float32(2.0)
+    seen_ns = {np.int64(-1)}
+    seen_ew = {np.int64(-1)}
+
+    for s in range(sess_starts.shape[0]):
+        s_start = sess_starts[s]
+        s_end = sess_ends[s]
+        np_ns = 0
+        np_ew = 0
+        for q in range(s_start, s_end):
+            i = proc_order[q]
+            np_ns = _elo_mark(idx_n[i], s, mark_ns, part_ns, np_ns, delta_ns, bc_ns)
+            np_ns = _elo_mark(idx_s[i], s, mark_ns, part_ns, np_ns, delta_ns, bc_ns)
+            np_ew = _elo_mark(idx_e[i], s, mark_ew, part_ew, np_ew, delta_ew, bc_ew)
+            np_ew = _elo_mark(idx_w[i], s, mark_ew, part_ew, np_ew, delta_ew, bc_ew)
+
+        b_s = s_start
+        while b_s < s_end:
+            b_e = b_s + 1
+            while b_e < s_end and board[proc_order[b_e]] == board[proc_order[b_e - 1]]:
+                b_e += 1
+            n_board = b_e - b_s
+            # Partnership rating = float32 mean of the two seats' snapshots.
+            for off in range(n_board):
+                i = proc_order[b_s + off]
+                buf_ns[off] = (ratings_ns[idx_n[i]] + ratings_ns[idx_s[i]]) / two
+                buf_ew[off] = (ratings_ew[idx_e[i]] + ratings_ew[idx_w[i]]) / two
+            sum_ns, mean_ns, sd_ns, st_ns, fs_ns = _elo_board_field(buf_ns, n_board, tmp, initial_rating, gsd_ns, anchors)
+            sum_ew, mean_ew, sd_ew, st_ew, fs_ew = _elo_board_field(buf_ew, n_board, tmp, initial_rating, gsd_ew, anchors)
+
+            for off in range(n_board):
+                i = proc_order[b_s + off]
+                pn = idx_n[i]
+                ps = idx_s[i]
+                pe = idx_e[i]
+                pw = idx_w[i]
+                ns_self = np.float64(buf_ns[off])
+                ew_self = np.float64(buf_ew[off])
+                if n_board >= 2:
+                    field_avg_ns = (sum_ns - ns_self) / (n_board - 1)
+                    field_avg_ew = (sum_ew - ew_self) / (n_board - 1)
+                else:
+                    field_avg_ns = ns_self
+                    field_avg_ew = ew_self
+                e_ns = 1.0 / (1.0 + 10.0 ** (-(ns_self - field_avg_ns) / elo_scale))
+                e_ew = 1.0 / (1.0 + 10.0 ** (-(ew_self - field_avg_ew) / elo_scale))
+                sc = np.float64(scale[i])
+                em = np.float64(emp[i])
+                k_n = k_base * (1.5 if bp_ns[pn] < provisional_boost_until else 1.0) * sc * st_ns * fs_ns * em
+                k_s = k_base * (1.5 if bp_ns[ps] < provisional_boost_until else 1.0) * sc * st_ns * fs_ns * em
+                k_e = k_base * (1.5 if bp_ew[pe] < provisional_boost_until else 1.0) * sc * st_ew * fs_ew * em
+                k_w = k_base * (1.5 if bp_ew[pw] < provisional_boost_until else 1.0) * sc * st_ew * fs_ew * em
+
+                r_n_before[i] = ratings_ns[pn]
+                r_s_before[i] = ratings_ns[ps]
+                r_e_before[i] = ratings_ew[pe]
+                r_w_before[i] = ratings_ew[pw]
+                e_ns_out[i] = e_ns
+                e_ew_out[i] = e_ew
+                sd_ns_out[i] = sd_ns
+                sd_ew_out[i] = sd_ew
+                mean_ns_out[i] = mean_ns
+                mean_ew_out[i] = mean_ew
+
+                s_ns = _elo_score(pct, i, skip_nan, score_amplifier)
+                if s_ns == -1.0:
+                    continue
+                res_ns = s_ns - e_ns
+                res_ew = (1.0 - s_ns) - e_ew
+                # Split the partnership delta 50/50 across the two seats.
+                delta_ns[pn] += 0.5 * k_n * res_ns
+                delta_ns[ps] += 0.5 * k_s * res_ns
+                delta_ew[pe] += 0.5 * k_e * res_ew
+                delta_ew[pw] += 0.5 * k_w * res_ew
+                bc_ns[pn] += 1
+                bc_ns[ps] += 1
+                bc_ew[pe] += 1
+                bc_ew[pw] += 1
+            b_s = b_e
+
+        code = sess_codes[s]
+        _elo_commit(part_ns, np_ns, ratings_ns, delta_ns, bc_ns, bp_ns, ns_sessions,
+                    seen_ns, use_seen, code, n_codes, null_ns, initial_rating, min_rating, max_rating)
+        _elo_commit(part_ew, np_ew, ratings_ew, delta_ew, bc_ew, bp_ew, ew_sessions,
+                    seen_ew, use_seen, code, n_codes, null_ew, initial_rating, min_rating, max_rating)
+
+        for q in range(s_start, s_end):
+            i = proc_order[q]
+            r_n_after[i] = ratings_ns[idx_n[i]]
+            r_s_after[i] = ratings_ns[idx_s[i]]
+            r_e_after[i] = ratings_ew[idx_e[i]]
+            r_w_after[i] = ratings_ew[idx_w[i]]
+            n_n_out[i] = ns_sessions[idx_n[i]]
+            n_s_out[i] = ns_sessions[idx_s[i]]
+            n_e_out[i] = ew_sessions[idx_e[i]]
+            n_w_out[i] = ew_sessions[idx_w[i]]
+
+
+_ELO_JIT_NAMES = (
+    "_elo_block_sum_f32",
+    "_elo_pairwise_sum_f32",
+    "_elo_stratum_scale_k",
+    "_elo_field_strength_scale_k",
+    "_elo_board_field",
+    "_elo_score",
+    "_elo_mark",
+    "_elo_commit",
+    "_elo_pair_kernel",
+    "_elo_player_kernel",
+)
+_ELO_JIT_DONE = False
+_ELO_JIT_LOCK = threading.Lock()
+
+
+def _elo_ensure_jit() -> bool:
+    """Compile the Elo kernels with numba once; False if numba is missing."""
+    global _ELO_JIT_DONE
+    with _ELO_JIT_LOCK:
+        if not _ELO_JIT_DONE:
+            try:
+                import numba
+            except ImportError:
+                logger.warning("numba not installed; Elo kernels run as plain Python (slow).")
+                _ELO_JIT_DONE = True
+                return False
+            g = globals()
+            # Callees first; numba binds globals when a kernel compiles.
+            for name in _ELO_JIT_NAMES:
+                g[name] = numba.njit(cache=True, nogil=True)(g[name])
+            _ELO_JIT_DONE = True
+    return not isinstance(globals()["_elo_pair_kernel"], type(_elo_ensure_jit))
+
+
+def _elo_dense_ids(cols: List[pl.Series]) -> Tuple[List[np.ndarray], int, int]:
+    """Map id columns to shared dense int64 indexes.
+
+    Returns (index arrays, slot count, null slot or -1). Nulls share one slot,
+    like the None key of the old dicts.
+    """
+    allv = pl.concat([c.rename("v") for c in cols])
+    # Sorted, so codes follow the id sort order (session ids rely on that).
+    uniq = allv.drop_nulls().unique().sort()
+    n_uniq = uniq.len()
+    has_null = allv.null_count() > 0
+    lut = pl.DataFrame({"v": uniq, "k": pl.int_range(0, n_uniq, eager=True, dtype=pl.Int64)})
+    out = []
+    for c in cols:
+        # Hash join is much faster than search_sorted on strings. Null ids
+        # find no match and go to the null slot.
+        codes = (
+            pl.DataFrame({"v": c.rename("v")})
+            .join(lut, on="v", how="left", maintain_order="left")
+            .get_column("k")
+            .fill_null(n_uniq)
+        )
+        out.append(codes.to_numpy())
+    return out, n_uniq + (1 if has_null else 0), (n_uniq if has_null else -1)
+
+
+def _elo_session_layout(df_sorted: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, int, np.ndarray]:
+    """Processing order and session runs, as in the old loops.
+
+    Rows are lexsorted by (Date, session_id, Board); a session is a run of
+    equal session_id in that order. String session ids are replaced by codes
+    with the same sort order, which keeps the (stable) lexsort identical.
+    Returns proc_order, run starts, run ends, per-run session code, whether a
+    session id spans several runs, the code count, and the Board array.
+    """
+    n_rows = df_sorted.height
+    sid = df_sorted["session_id"]
+    if sid.dtype.is_numeric() or sid.dtype.is_temporal():
+        session_ids = sid.to_numpy()
+    else:
+        (codes,), _, _ = _elo_dense_ids([sid])
+        session_ids = codes
+    if "Date" in df_sorted.columns:
+        date_arr = df_sorted["Date"].to_numpy()
+    else:
+        date_arr = np.zeros(n_rows, dtype=np.int64)
+    if "Board" in df_sorted.columns:
+        board_arr = df_sorted["Board"].to_numpy()
+    else:
+        board_arr = np.zeros(n_rows, dtype=np.int32)
+    proc_order = np.lexsort((board_arr, session_ids, date_arr)).astype(np.int64)
+
+    sess_proc_seq = session_ids[proc_order]
+    if n_rows > 0:
+        sess_change = np.where(sess_proc_seq[:-1] != sess_proc_seq[1:])[0] + 1
+        starts = np.concatenate(([0], sess_change)).astype(np.int64)
+        ends = np.concatenate((sess_change, [n_rows])).astype(np.int64)
+    else:
+        starts = np.array([], dtype=np.int64)
+        ends = np.array([], dtype=np.int64)
+
+    # Old code kept a set of session ids per entity. Only needed when one
+    # session id shows up in more than one run (e.g. split across dates).
+    run_vals = sess_proc_seq[starts]
+    uniq_vals, run_codes = np.unique(run_vals, return_inverse=True)
+    use_seen = len(uniq_vals) != len(run_vals)
+    # Board compared as float64 so NaN boards never match (as in numpy !=).
+    board_f = board_arr.astype(np.float64)
+    return proc_order, starts, ends, run_codes.astype(np.int64), bool(use_seen), int(len(uniq_vals)), board_f
+
+
+def _elo_pct_array(df_sorted: pl.DataFrame) -> Tuple[np.ndarray, bool]:
+    """Pct_NS as numpy plus whether NaN rows are skipped.
+
+    The old loop skipped NaN only for float64 values (isinstance(x, float)),
+    so a float32 NaN still reached the update. Kept as is.
+    """
+    pct = df_sorted["Pct_NS"].to_numpy()
+    skip_nan = pct.dtype == np.float64
+    if pct.dtype.kind != "f":
+        pct = pct.astype(np.float64)
+    return pct, bool(skip_nan)
+
+
+def _elo_section_scale(df_sorted: pl.DataFrame, n_rows: int, max_section_pairs: float) -> np.ndarray:
+    """Section-size K scale sqrt((pairs-1)/11), pairs capped at max_section_pairs."""
+    scale = np.ones(n_rows, dtype=np.float32)
+    if "Section_Pairs" in df_sorted.columns:
+        pairs = df_sorted["Section_Pairs"].cast(pl.Float32).to_numpy()
+    elif "Num_Pairs" in df_sorted.columns:
+        pairs = df_sorted["Num_Pairs"].cast(pl.Float32).to_numpy()
+    elif "MP_Top" in df_sorted.columns:
+        pairs = (df_sorted["MP_Top"].cast(pl.Float32).to_numpy() / 2.0) + 1.0
+    else:
+        pairs = None
+    if pairs is not None:
+        # Sanitize: NaN/inf -> 1.0 (no scale boost). Then cap to max_section_pairs
+        # so a junk upstream value can't drive K to absurd multiples (the original
+        # bug behind ±100k Elo outliers — see TODO.md).
+        pairs = np.where(np.isfinite(pairs), pairs, 1.0)
+        pairs = np.minimum(pairs, np.float32(max_section_pairs))
+        with np.errstate(invalid="ignore"):
+            valid = pairs > 1.0
+        scale_valid = np.sqrt(np.maximum(pairs[valid] - 1.0, 1.0) / 11.0)
+        scale[valid] = scale_valid
+    return scale
+
+
+def _elo_anchors() -> np.ndarray:
+    return np.array([
+        STRATUM_DAMPENING_LOW_RATIO, STRATUM_DAMPENING_HIGH_RATIO, STRATUM_DAMPENING_K_MIN,
+        FIELD_STRENGTH_Z_FULL, FIELD_STRENGTH_Z_FLOOR, FIELD_STRENGTH_K_MIN,
+    ], dtype=np.float64)
+
+
+def _elo_attach(df_sorted: pl.DataFrame, out_df: pl.DataFrame, replace_existing: bool) -> pl.DataFrame:
+    if replace_existing:
+        cols = [c for c in out_df.columns if c in df_sorted.columns]
+        if cols:
+            df_sorted = df_sorted.drop(cols)
+    return df_sorted.hstack(out_df)
 
 
 def compute_pair_matchpoint_elo_ratings(
@@ -4021,6 +4593,39 @@ def compute_pair_matchpoint_elo_ratings(
     Returns:
     - Original DataFrame with the listed columns appended.
     """
+    out_df = _pair_elo_frame(
+        df_sorted,
+        initial_rating=initial_rating,
+        k_base=k_base,
+        provisional_boost_until=provisional_boost_until,
+        minimum_sessions=minimum_sessions,
+        elo_scale=elo_scale,
+        score_amplifier=score_amplifier,
+        max_section_pairs=max_section_pairs,
+        min_rating=min_rating,
+        max_rating=max_rating,
+        global_stdev_ns=global_stdev_ns,
+        global_stdev_ew=global_stdev_ew,
+    )
+    return _elo_attach(df_sorted, out_df, replace_existing)
+
+
+def _pair_elo_frame(
+    df_sorted: pl.DataFrame,
+    *,
+    initial_rating: float = 1500.0,
+    k_base: float = 24.0,
+    provisional_boost_until: int = 100,
+    minimum_sessions: int = 10,
+    elo_scale: float = 400.0,
+    score_amplifier: float = 1.0,
+    max_section_pairs: float = 60.0,
+    min_rating: float = 200.0,
+    max_rating: float = 3000.0,
+    global_stdev_ns: float | None = None,
+    global_stdev_ew: float | None = None,
+) -> pl.DataFrame:
+    """Output columns of compute_pair_matchpoint_elo_ratings (not attached)."""
     need_cols = {"Pct_NS", "session_id"}
     missing = need_cols - set(df_sorted.columns)
     if missing:
@@ -4036,7 +4641,6 @@ def compute_pair_matchpoint_elo_ratings(
             _Pair_ID_EW=pair_key_expr("Player_ID_E", "Player_ID_W"),
         )
         ns_pair_col, ew_pair_col = "_Pair_ID_NS", "_Pair_ID_EW"
-        _added_temp_pair_cols = True
     else:
         if not {"Pair_Number_NS", "Pair_Number_EW"}.issubset(df_sorted.columns):
             raise ValueError(
@@ -4049,51 +4653,18 @@ def compute_pair_matchpoint_elo_ratings(
             "not found. Falling back to session-scoped Pair_Number_NS/EW — "
             "this conflates unrelated partnerships across sessions and is "
             "INCORRECT. See TODO.md 'Pair-level Elo column is broken'.",
-            stacklevel=2,
+            stacklevel=3,
         )
         ns_pair_col, ew_pair_col = "Pair_Number_NS", "Pair_Number_EW"
-        _added_temp_pair_cols = False
 
     n_rows = df_sorted.height
-    ns_pairs = df_sorted[ns_pair_col].to_list()
-    ew_pairs = df_sorted[ew_pair_col].to_list()
-    pct_ns = df_sorted["Pct_NS"].to_numpy()
-    session_ids = df_sorted["session_id"].to_numpy()
+    pct_ns, skip_nan = _elo_pct_array(df_sorted)
+    scale = _elo_section_scale(df_sorted, n_rows, max_section_pairs)
 
-    # Section-size scaling vector
-    scale = np.ones(n_rows, dtype=np.float32)
-    if "Section_Pairs" in df_sorted.columns:
-        pairs = df_sorted["Section_Pairs"].cast(pl.Float32).to_numpy()
-    elif "Num_Pairs" in df_sorted.columns:
-        pairs = df_sorted["Num_Pairs"].cast(pl.Float32).to_numpy()
-    elif "MP_Top" in df_sorted.columns:
-        pairs = (df_sorted["MP_Top"].cast(pl.Float32).to_numpy() / 2.0) + 1.0
-    else:
-        pairs = None
-    if pairs is not None:
-        # Sanitize: NaN/inf -> 1.0 (no scale boost). Then cap to max_section_pairs
-        # so a junk upstream value can't drive K to absurd multiples (the original
-        # bug behind ±100k Elo outliers — see TODO.md).
-        pairs = np.where(np.isfinite(pairs), pairs, 1.0)
-        pairs = np.minimum(pairs, np.float32(max_section_pairs))
-        with np.errstate(invalid="ignore"):
-            valid = pairs > 1.0
-        scale_valid = np.sqrt(np.maximum(pairs[valid] - 1.0, 1.0) / 11.0)
-        scale[valid] = scale_valid
-
-    # Map pair ids to contiguous indices per direction. Uses the stable
-    # Player_ID-derived key when available, session-scoped Pair_Number otherwise.
-    ns_unique = df_sorted[ns_pair_col].unique().to_list()
-    ew_unique = df_sorted[ew_pair_col].unique().to_list()
-    ns_index = {pid: i for i, pid in enumerate(ns_unique)}
-    ew_index = {pid: i for i, pid in enumerate(ew_unique)}
-
-    ratings_ns = np.full(len(ns_unique), initial_rating, dtype=np.float32)
-    ratings_ew = np.full(len(ew_unique), initial_rating, dtype=np.float32)
-    boards_played_ns = np.zeros(len(ns_unique), dtype=np.int32)
-    boards_played_ew = np.zeros(len(ew_unique), dtype=np.int32)
-    sessions_ns = [set() for _ in range(len(ns_unique))]
-    sessions_ew = [set() for _ in range(len(ew_unique))]
+    # Dense pair indexes per direction (stable Player_ID key when available,
+    # session-scoped Pair_Number otherwise). Null ids share one slot.
+    (ns_indices,), n_ns_slots, null_ns = _elo_dense_ids([df_sorted[ns_pair_col]])
+    (ew_indices,), n_ew_slots, null_ew = _elo_dense_ids([df_sorted[ew_pair_col]])
 
     # Outputs (indexed by ORIGINAL row position)
     r_ns_before_arr = np.empty(n_rows, dtype=np.float32)
@@ -4113,10 +4684,6 @@ def compute_pair_matchpoint_elo_ratings(
     # downstream analyses can verify the new field-strength dampening.
     field_mean_ns_arr = np.empty(n_rows, dtype=np.float32)
     field_mean_ew_arr = np.empty(n_rows, dtype=np.float32)
-
-    # Pre-compute pair-index lookups per row.
-    ns_indices = np.array([ns_index[v] for v in ns_pairs], dtype=np.int32)
-    ew_indices = np.array([ew_index[v] for v in ew_pairs], dtype=np.int32)
 
     # K-dampening seeds. Order of preference:
     #   1. Caller-supplied global_stdev_ns / _ew (e.g., from a previous-run
@@ -4143,183 +4710,23 @@ def compute_pair_matchpoint_elo_ratings(
     # Processing order: (Date, session_id, Board) so a session's boards are
     # contiguous and oldest sessions are processed first. Falls back gracefully
     # when Date / Board are absent.
-    if "Date" in df_sorted.columns:
-        date_arr = df_sorted["Date"].to_numpy()
-    else:
-        date_arr = np.zeros(n_rows, dtype=np.int64)
-    if "Board" in df_sorted.columns:
-        board_arr = df_sorted["Board"].to_numpy()
-    else:
-        board_arr = np.zeros(n_rows, dtype=np.int32)
-    proc_order = np.lexsort((board_arr, session_ids, date_arr))
+    proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes, board_f = _elo_session_layout(df_sorted)
+    max_len = int((sess_ends - sess_starts).max()) if sess_starts.size else 0
 
-    # Session boundaries in proc_order (start index, end index exclusive).
-    sess_proc_seq = session_ids[proc_order]
-    if n_rows > 0:
-        sess_change = np.where(sess_proc_seq[:-1] != sess_proc_seq[1:])[0] + 1
-        session_bounds_starts = np.concatenate(([0], sess_change))
-        session_bounds_ends = np.concatenate((sess_change, [n_rows]))
-    else:
-        session_bounds_starts = np.array([], dtype=np.int64)
-        session_bounds_ends = np.array([], dtype=np.int64)
-
-    # Per-session loop with per-board field-relative updates and per-session commit.
-    for s_start, s_end in zip(session_bounds_starts, session_bounds_ends):
-        rows = proc_order[s_start:s_end]
-        if rows.size == 0:
-            continue
-        session_id_value = session_ids[rows[0]]
-
-        # Snapshot every participating pair's rating at session start.
-        ns_idx_in_session = np.unique(ns_indices[rows])
-        ew_idx_in_session = np.unique(ew_indices[rows])
-        snap_ns = {int(idx): float(ratings_ns[idx]) for idx in ns_idx_in_session}
-        snap_ew = {int(idx): float(ratings_ew[idx]) for idx in ew_idx_in_session}
-        delta_ns = {int(idx): 0.0 for idx in ns_idx_in_session}
-        delta_ew = {int(idx): 0.0 for idx in ew_idx_in_session}
-        bcount_ns = {int(idx): 0 for idx in ns_idx_in_session}
-        bcount_ew = {int(idx): 0 for idx in ew_idx_in_session}
-
-        # Iterate boards within the session (contiguous runs of same Board in proc_order).
-        b_seq = board_arr[rows]
-        if rows.size > 0:
-            b_change = np.where(b_seq[:-1] != b_seq[1:])[0] + 1
-            board_starts = np.concatenate(([0], b_change))
-            board_ends = np.concatenate((b_change, [rows.size]))
-        else:
-            board_starts = np.array([], dtype=np.int64)
-            board_ends = np.array([], dtype=np.int64)
-
-        for b_s, b_e in zip(board_starts, board_ends):
-            board_rows = rows[b_s:b_e]
-            n_board = board_rows.size
-            ns_idx_board = ns_indices[board_rows]
-            ew_idx_board = ew_indices[board_rows]
-            r_ns_snap = np.array([snap_ns[int(idx)] for idx in ns_idx_board], dtype=np.float32)
-            r_ew_snap = np.array([snap_ew[int(idx)] for idx in ew_idx_board], dtype=np.float32)
-            sum_ns = float(r_ns_snap.sum())
-            sum_ew = float(r_ew_snap.sum())
-            if n_board >= 2:
-                mean_ns_field = sum_ns / n_board
-                mean_ew_field = sum_ew / n_board
-                stdev_ns_field = float(np.sqrt(((r_ns_snap - mean_ns_field) ** 2).sum() / n_board))
-                stdev_ew_field = float(np.sqrt(((r_ew_snap - mean_ew_field) ** 2).sum() / n_board))
-                ratio_ns = stdev_ns_field / global_stdev_ns
-                ratio_ew = stdev_ew_field / global_stdev_ew
-                stratum_scale_ns = _stratum_scale(ratio_ns)
-                stratum_scale_ew = _stratum_scale(ratio_ew)
-                # Field-strength dampening: z-score of board's field-mean
-                # against the population mean (initial_rating). z >= 0 means
-                # at-or-above-average field → full K; z <= floor → k_min.
-                z_ns = (mean_ns_field - initial_rating) / global_stdev_ns
-                z_ew = (mean_ew_field - initial_rating) / global_stdev_ew
-                field_strength_ns = _field_strength_scale(z_ns)
-                field_strength_ew = _field_strength_scale(z_ew)
-            else:
-                mean_ns_field = float(r_ns_snap[0]) if n_board == 1 else 0.0
-                mean_ew_field = float(r_ew_snap[0]) if n_board == 1 else 0.0
-                stdev_ns_field = 0.0
-                stdev_ew_field = 0.0
-                stratum_scale_ns = 1.0
-                stratum_scale_ew = 1.0
-                field_strength_ns = 1.0
-                field_strength_ew = 1.0
-
-            for offset in range(n_board):
-                i = int(board_rows[offset])
-                idx_ns = int(ns_idx_board[offset])
-                idx_ew = int(ew_idx_board[offset])
-                r_ns_self = float(r_ns_snap[offset])
-                r_ew_self = float(r_ew_snap[offset])
-
-                if n_board >= 2:
-                    field_avg_ns = (sum_ns - r_ns_self) / (n_board - 1)
-                    field_avg_ew = (sum_ew - r_ew_self) / (n_board - 1)
-                else:
-                    # Degenerate single-table board: no field comparison possible.
-                    field_avg_ns = r_ns_self
-                    field_avg_ew = r_ew_self
-
-                e_ns = 1.0 / (1.0 + 10.0 ** (-(r_ns_self - field_avg_ns) / elo_scale))
-                e_ew = 1.0 / (1.0 + 10.0 ** (-(r_ew_self - field_avg_ew) / elo_scale))
-
-                # K factor with provisional boost (per-pair counter), section
-                # scaling, stratum-mixed dampening, field-strength dampening
-                # (Zubatch), AND event MP-limit scale (Open ≫ restricted).
-                boost_ns = 1.5 if boards_played_ns[idx_ns] < provisional_boost_until else 1.0
-                boost_ew = 1.5 if boards_played_ew[idx_ew] < provisional_boost_until else 1.0
-                emp = float(event_mp_scale[i])
-                k_ns = k_base * boost_ns * float(scale[i]) * stratum_scale_ns * field_strength_ns * emp
-                k_ew = k_base * boost_ew * float(scale[i]) * stratum_scale_ew * field_strength_ew * emp
-
-                # Outputs: Before == session-start snapshot, E == field-relative.
-                r_ns_before_arr[i] = r_ns_self
-                r_ew_before_arr[i] = r_ew_self
-                e_ns_arr[i] = e_ns
-                e_ew_arr[i] = e_ew
-                field_stdev_ns_arr[i] = stdev_ns_field
-                field_stdev_ew_arr[i] = stdev_ew_field
-                field_mean_ns_arr[i] = mean_ns_field
-                field_mean_ew_arr[i] = mean_ew_field
-
-                s_ns = pct_ns[i]
-                if s_ns is not None and not (isinstance(s_ns, float) and np.isnan(s_ns)):
-                    s_ns_f = float(s_ns)
-                    # Skip corrupt matchpoint percentages. Do not clamp 9.99
-                    # to 1.0 — that would still apply a ~50-point residual.
-                    if s_ns_f < 0.0 or s_ns_f > 1.0:
-                        continue
-                    if score_amplifier != 1.0:
-                        s_ns_f = 0.5 + score_amplifier * (s_ns_f - 0.5)
-                        if s_ns_f < 0.0:
-                            s_ns_f = 0.0
-                        elif s_ns_f > 1.0:
-                            s_ns_f = 1.0
-                    s_ew_f = 1.0 - s_ns_f
-
-                    # Accumulate per-pair delta for end-of-session commit.
-                    delta_ns[idx_ns] += k_ns * (s_ns_f - e_ns)
-                    delta_ew[idx_ew] += k_ew * (s_ew_f - e_ew)
-                    bcount_ns[idx_ns] += 1
-                    bcount_ew[idx_ew] += 1
-
-        # End of session: commit accumulated deltas with hard clamp, update
-        # counters, mark session participation.
-        for idx, d in delta_ns.items():
-            new_r = ratings_ns[idx] + d
-            if new_r < min_rating:
-                new_r = min_rating
-            elif new_r > max_rating:
-                new_r = max_rating
-            ratings_ns[idx] = new_r
-            boards_played_ns[idx] += bcount_ns[idx]
-            if bcount_ns[idx] > 0:
-                sessions_ns[idx].add(session_id_value)
-        for idx, d in delta_ew.items():
-            new_r = ratings_ew[idx] + d
-            if new_r < min_rating:
-                new_r = min_rating
-            elif new_r > max_rating:
-                new_r = max_rating
-            ratings_ew[idx] = new_r
-            boards_played_ew[idx] += bcount_ew[idx]
-            if bcount_ew[idx] > 0:
-                sessions_ew[idx].add(session_id_value)
-        _reset_unrated_slot(ns_index, ratings_ns, boards_played_ns, sessions_ns, initial_rating)
-        _reset_unrated_slot(ew_index, ratings_ew, boards_played_ew, sessions_ew, initial_rating)
-
-        # Second pass over the session's rows to write After / Elo_N / Delta_After
-        # using the now-committed ratings. r_ns_after for each row is the pair's
-        # final post-session rating (constant within session).
-        for i_int in (int(x) for x in rows):
-            idx_ns = int(ns_indices[i_int])
-            idx_ew = int(ew_indices[i_int])
-            r_ns_after_arr[i_int] = ratings_ns[idx_ns]
-            r_ew_after_arr[i_int] = ratings_ew[idx_ew]
-            n_ns_arr[i_int] = len(sessions_ns[idx_ns])
-            n_ew_arr[i_int] = len(sessions_ew[idx_ew])
-            delta_before_arr[i_int] = r_ns_before_arr[i_int] - r_ew_before_arr[i_int]
-            delta_after_arr[i_int] = r_ns_after_arr[i_int] - r_ew_after_arr[i_int]
+    # Per-session loop with per-board field-relative updates and per-session
+    # commit, compiled with numba (see _elo_pair_kernel).
+    _elo_ensure_jit()
+    _elo_pair_kernel(
+        proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes,
+        board_f, ns_indices, ew_indices, pct_ns, skip_nan, scale, event_mp_scale,
+        n_ns_slots, n_ew_slots, null_ns, null_ew, max_len,
+        float(initial_rating), float(k_base), int(provisional_boost_until), float(elo_scale),
+        float(score_amplifier), float(min_rating), float(max_rating),
+        float(global_stdev_ns), float(global_stdev_ew), _elo_anchors(),
+        r_ns_before_arr, r_ew_before_arr, e_ns_arr, e_ew_arr, r_ns_after_arr, r_ew_after_arr,
+        n_ns_arr, n_ew_arr, delta_before_arr, delta_after_arr,
+        field_stdev_ns_arr, field_stdev_ew_arr, field_mean_ns_arr, field_mean_ew_arr,
+    )
 
     # Set Elo ratings to None if session count is less than minimum_sessions
     r_ns_final = np.where(n_ns_arr < minimum_sessions, np.nan, r_ns_after_arr)
@@ -4343,15 +4750,7 @@ def compute_pair_matchpoint_elo_ratings(
         "Field_Mean_NS": field_mean_ns_arr,
         "Field_Mean_EW": field_mean_ew_arr,
     })
-    if replace_existing:
-        cols = [c for c in out_df.columns if c in df_sorted.columns]
-        if cols:
-            df_sorted = df_sorted.drop(cols)
-    if _added_temp_pair_cols:
-        df_sorted = df_sorted.drop(
-            [c for c in ("_Pair_ID_NS", "_Pair_ID_EW") if c in df_sorted.columns]
-        )
-    return df_sorted.hstack(out_df)
+    return out_df
 
 
 def compute_player_matchpoint_elo_ratings(
@@ -4415,6 +4814,39 @@ def compute_player_matchpoint_elo_ratings(
     Returns:
     - Original DataFrame with the listed columns appended.
     """
+    out_df = _player_elo_frame(
+        df_sorted,
+        initial_rating=initial_rating,
+        k_base=k_base,
+        provisional_boost_until=provisional_boost_until,
+        minimum_sessions=minimum_sessions,
+        elo_scale=elo_scale,
+        score_amplifier=score_amplifier,
+        max_section_pairs=max_section_pairs,
+        min_rating=min_rating,
+        max_rating=max_rating,
+        global_stdev_ns=global_stdev_ns,
+        global_stdev_ew=global_stdev_ew,
+    )
+    return _elo_attach(df_sorted, out_df, replace_existing)
+
+
+def _player_elo_frame(
+    df_sorted: pl.DataFrame,
+    *,
+    initial_rating: float = 1500.0,
+    k_base: float = 24.0,
+    provisional_boost_until: int = 100,
+    minimum_sessions: int = 10,
+    elo_scale: float = 400.0,
+    score_amplifier: float = 1.0,
+    max_section_pairs: float = 60.0,
+    min_rating: float = 200.0,
+    max_rating: float = 3000.0,
+    global_stdev_ns: float | None = None,
+    global_stdev_ew: float | None = None,
+) -> pl.DataFrame:
+    """Output columns of compute_player_matchpoint_elo_ratings (not attached)."""
     need_cols = {
         "Player_ID_N",
         "Player_ID_S",
@@ -4428,55 +4860,16 @@ def compute_player_matchpoint_elo_ratings(
         raise ValueError(f"Missing columns: {missing}")
 
     n_rows = df_sorted.height
-    pid_n_arr = df_sorted["Player_ID_N"].to_list()
-    pid_s_arr = df_sorted["Player_ID_S"].to_list()
-    pid_e_arr = df_sorted["Player_ID_E"].to_list()
-    pid_w_arr = df_sorted["Player_ID_W"].to_list()
-    pct_ns = df_sorted["Pct_NS"].to_numpy()
-    session_ids = df_sorted["session_id"].to_numpy()
+    pct_ns, skip_nan = _elo_pct_array(df_sorted)
+    scale = _elo_section_scale(df_sorted, n_rows, max_section_pairs)
 
-    # Section-size scaling vector (same precedence as pair Elo)
-    scale = np.ones(n_rows, dtype=np.float32)
-    if "Section_Pairs" in df_sorted.columns:
-        pairs = df_sorted["Section_Pairs"].cast(pl.Float32).to_numpy()
-    elif "Num_Pairs" in df_sorted.columns:
-        pairs = df_sorted["Num_Pairs"].cast(pl.Float32).to_numpy()
-    elif "MP_Top" in df_sorted.columns:
-        pairs = (df_sorted["MP_Top"].cast(pl.Float32).to_numpy() / 2.0) + 1.0
-    else:
-        pairs = None
-    if pairs is not None:
-        pairs = np.where(np.isfinite(pairs), pairs, 1.0)
-        pairs = np.minimum(pairs, np.float32(max_section_pairs))
-        with np.errstate(invalid="ignore"):
-            valid = pairs > 1.0
-        scale_valid = np.sqrt(np.maximum(pairs[valid] - 1.0, 1.0) / 11.0)
-        scale[valid] = scale_valid
-
-    # Map player ids to contiguous indices per direction
-    ns_player_unique = pl.concat([
-        df_sorted["Player_ID_N"],
-        df_sorted["Player_ID_S"],
-    ]).unique().to_list()
-    ew_player_unique = pl.concat([
-        df_sorted["Player_ID_E"],
-        df_sorted["Player_ID_W"],
-    ]).unique().to_list()
-    idx_ns_map = {pid: i for i, pid in enumerate(ns_player_unique)}
-    idx_ew_map = {pid: i for i, pid in enumerate(ew_player_unique)}
-
-    ratings_ns = np.full(len(ns_player_unique), initial_rating, dtype=np.float32)
-    ratings_ew = np.full(len(ew_player_unique), initial_rating, dtype=np.float32)
-    boards_played_ns = np.zeros(len(ns_player_unique), dtype=np.int32)
-    boards_played_ew = np.zeros(len(ew_player_unique), dtype=np.int32)
-    sessions_ns = [set() for _ in range(len(ns_player_unique))]
-    sessions_ew = [set() for _ in range(len(ew_player_unique))]
-
-    # Pre-compute per-row seat indices.
-    idx_n_arr = np.array([idx_ns_map[pid] for pid in pid_n_arr], dtype=np.int32)
-    idx_s_arr = np.array([idx_ns_map[pid] for pid in pid_s_arr], dtype=np.int32)
-    idx_e_arr = np.array([idx_ew_map[pid] for pid in pid_e_arr], dtype=np.int32)
-    idx_w_arr = np.array([idx_ew_map[pid] for pid in pid_w_arr], dtype=np.int32)
+    # Dense player indexes per direction (N+S share one map, E+W another).
+    (idx_n_arr, idx_s_arr), n_ns_slots, null_ns = _elo_dense_ids(
+        [df_sorted["Player_ID_N"], df_sorted["Player_ID_S"]]
+    )
+    (idx_e_arr, idx_w_arr), n_ew_slots, null_ew = _elo_dense_ids(
+        [df_sorted["Player_ID_E"], df_sorted["Player_ID_W"]]
+    )
 
     # Outputs (indexed by ORIGINAL row position)
     R_N_Before = np.empty(n_rows, dtype=np.float32)
@@ -4493,7 +4886,6 @@ def compute_player_matchpoint_elo_ratings(
     N_S = np.empty(n_rows, dtype=np.int32)
     N_E = np.empty(n_rows, dtype=np.int32)
     N_W = np.empty(n_rows, dtype=np.int32)
-    Elo_Delta_Before = np.empty(n_rows, dtype=np.float32)
     Field_Stdev_NS_Player = np.empty(n_rows, dtype=np.float32)
     Field_Stdev_EW_Player = np.empty(n_rows, dtype=np.float32)
     # New (Zubatch fix): per-board same-direction partnership-rating MEAN.
@@ -4520,189 +4912,23 @@ def compute_player_matchpoint_elo_ratings(
     )
 
     # Processing order: (Date, session_id, Board) — same as pair function.
-    if "Date" in df_sorted.columns:
-        date_arr = df_sorted["Date"].to_numpy()
-    else:
-        date_arr = np.zeros(n_rows, dtype=np.int64)
-    if "Board" in df_sorted.columns:
-        board_arr = df_sorted["Board"].to_numpy()
-    else:
-        board_arr = np.zeros(n_rows, dtype=np.int32)
-    proc_order = np.lexsort((board_arr, session_ids, date_arr))
+    proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes, board_f = _elo_session_layout(df_sorted)
+    max_len = int((sess_ends - sess_starts).max()) if sess_starts.size else 0
 
-    sess_proc_seq = session_ids[proc_order]
-    if n_rows > 0:
-        sess_change = np.where(sess_proc_seq[:-1] != sess_proc_seq[1:])[0] + 1
-        session_bounds_starts = np.concatenate(([0], sess_change))
-        session_bounds_ends = np.concatenate((sess_change, [n_rows]))
-    else:
-        session_bounds_starts = np.array([], dtype=np.int64)
-        session_bounds_ends = np.array([], dtype=np.int64)
-
-    for s_start, s_end in zip(session_bounds_starts, session_bounds_ends):
-        rows = proc_order[s_start:s_end]
-        if rows.size == 0:
-            continue
-        session_id_value = session_ids[rows[0]]
-
-        # Snapshot participating players at session start.
-        ns_seats_in_session = np.unique(np.concatenate([idx_n_arr[rows], idx_s_arr[rows]]))
-        ew_seats_in_session = np.unique(np.concatenate([idx_e_arr[rows], idx_w_arr[rows]]))
-        snap_ns = {int(idx): float(ratings_ns[idx]) for idx in ns_seats_in_session}
-        snap_ew = {int(idx): float(ratings_ew[idx]) for idx in ew_seats_in_session}
-        delta_ns = {int(idx): 0.0 for idx in ns_seats_in_session}
-        delta_ew = {int(idx): 0.0 for idx in ew_seats_in_session}
-        bcount_ns = {int(idx): 0 for idx in ns_seats_in_session}
-        bcount_ew = {int(idx): 0 for idx in ew_seats_in_session}
-
-        b_seq = board_arr[rows]
-        if rows.size > 0:
-            b_change = np.where(b_seq[:-1] != b_seq[1:])[0] + 1
-            board_starts = np.concatenate(([0], b_change))
-            board_ends = np.concatenate((b_change, [rows.size]))
-        else:
-            board_starts = np.array([], dtype=np.int64)
-            board_ends = np.array([], dtype=np.int64)
-
-        for b_s, b_e in zip(board_starts, board_ends):
-            board_rows = rows[b_s:b_e]
-            n_board = board_rows.size
-            # Partnership averages for this board (snapshot).
-            r_n_snap = np.array([snap_ns[int(idx)] for idx in idx_n_arr[board_rows]], dtype=np.float32)
-            r_s_snap = np.array([snap_ns[int(idx)] for idx in idx_s_arr[board_rows]], dtype=np.float32)
-            r_e_snap = np.array([snap_ew[int(idx)] for idx in idx_e_arr[board_rows]], dtype=np.float32)
-            r_w_snap = np.array([snap_ew[int(idx)] for idx in idx_w_arr[board_rows]], dtype=np.float32)
-            ns_partnership = (r_n_snap + r_s_snap) / 2.0
-            ew_partnership = (r_e_snap + r_w_snap) / 2.0
-            sum_ns_part = float(ns_partnership.sum())
-            sum_ew_part = float(ew_partnership.sum())
-            if n_board >= 2:
-                mean_ns_field = sum_ns_part / n_board
-                mean_ew_field = sum_ew_part / n_board
-                stdev_ns_field = float(np.sqrt(((ns_partnership - mean_ns_field) ** 2).sum() / n_board))
-                stdev_ew_field = float(np.sqrt(((ew_partnership - mean_ew_field) ** 2).sum() / n_board))
-                stratum_scale_ns = _stratum_scale(stdev_ns_field / global_stdev_ns)
-                stratum_scale_ew = _stratum_scale(stdev_ew_field / global_stdev_ew)
-                # Field-strength dampening (Zubatch fix). Mirrors the same
-                # mechanism in compute_pair_matchpoint_elo_ratings — see
-                # docstring there for the structural motivation.
-                z_ns = (mean_ns_field - initial_rating) / global_stdev_ns
-                z_ew = (mean_ew_field - initial_rating) / global_stdev_ew
-                field_strength_ns = _field_strength_scale(z_ns)
-                field_strength_ew = _field_strength_scale(z_ew)
-            else:
-                mean_ns_field = float(ns_partnership[0]) if n_board == 1 else 0.0
-                mean_ew_field = float(ew_partnership[0]) if n_board == 1 else 0.0
-                stdev_ns_field = 0.0
-                stdev_ew_field = 0.0
-                stratum_scale_ns = 1.0
-                stratum_scale_ew = 1.0
-                field_strength_ns = 1.0
-                field_strength_ew = 1.0
-
-            for offset in range(n_board):
-                i = int(board_rows[offset])
-                idx_n = int(idx_n_arr[i])
-                idx_s = int(idx_s_arr[i])
-                idx_e = int(idx_e_arr[i])
-                idx_w = int(idx_w_arr[i])
-                ns_self = float(ns_partnership[offset])
-                ew_self = float(ew_partnership[offset])
-
-                if n_board >= 2:
-                    field_avg_ns = (sum_ns_part - ns_self) / (n_board - 1)
-                    field_avg_ew = (sum_ew_part - ew_self) / (n_board - 1)
-                else:
-                    field_avg_ns = ns_self
-                    field_avg_ew = ew_self
-
-                e_ns = 1.0 / (1.0 + 10.0 ** (-(ns_self - field_avg_ns) / elo_scale))
-                e_ew = 1.0 / (1.0 + 10.0 ** (-(ew_self - field_avg_ew) / elo_scale))
-
-                # K factor: stratum dampening + field-strength (Zubatch) +
-                # event MP-limit scale (Open ≫ restricted); see pair function.
-                emp = float(event_mp_scale[i])
-                k_n = k_base * (1.5 if boards_played_ns[idx_n] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ns * field_strength_ns * emp
-                k_s = k_base * (1.5 if boards_played_ns[idx_s] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ns * field_strength_ns * emp
-                k_e = k_base * (1.5 if boards_played_ew[idx_e] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ew * field_strength_ew * emp
-                k_w = k_base * (1.5 if boards_played_ew[idx_w] < provisional_boost_until else 1.0) * float(scale[i]) * stratum_scale_ew * field_strength_ew * emp
-
-                R_N_Before[i] = snap_ns[idx_n]
-                R_S_Before[i] = snap_ns[idx_s]
-                R_E_Before[i] = snap_ew[idx_e]
-                R_W_Before[i] = snap_ew[idx_w]
-                E_NS[i] = e_ns
-                E_EW[i] = e_ew
-                Field_Stdev_NS_Player[i] = stdev_ns_field
-                Field_Stdev_EW_Player[i] = stdev_ew_field
-                Field_Mean_NS_Player[i] = mean_ns_field
-                Field_Mean_EW_Player[i] = mean_ew_field
-
-                s_ns = pct_ns[i]
-                if s_ns is not None and not (isinstance(s_ns, float) and np.isnan(s_ns)):
-                    s_ns_f = float(s_ns)
-                    # Skip corrupt matchpoint percentages. Do not clamp 9.99
-                    # to 1.0 — that would still apply a ~50-point residual.
-                    if s_ns_f < 0.0 or s_ns_f > 1.0:
-                        continue
-                    if score_amplifier != 1.0:
-                        s_ns_f = 0.5 + score_amplifier * (s_ns_f - 0.5)
-                        if s_ns_f < 0.0:
-                            s_ns_f = 0.0
-                        elif s_ns_f > 1.0:
-                            s_ns_f = 1.0
-                    delta_ns_residual = s_ns_f - e_ns
-                    delta_ew_residual = (1.0 - s_ns_f) - e_ew
-                    # Split partnership delta 50/50 across the two seats.
-                    delta_ns[idx_n] += 0.5 * k_n * delta_ns_residual
-                    delta_ns[idx_s] += 0.5 * k_s * delta_ns_residual
-                    delta_ew[idx_e] += 0.5 * k_e * delta_ew_residual
-                    delta_ew[idx_w] += 0.5 * k_w * delta_ew_residual
-                    bcount_ns[idx_n] += 1
-                    bcount_ns[idx_s] += 1
-                    bcount_ew[idx_e] += 1
-                    bcount_ew[idx_w] += 1
-
-        # Commit session deltas with hard clamp.
-        for idx, d in delta_ns.items():
-            new_r = ratings_ns[idx] + d
-            if new_r < min_rating:
-                new_r = min_rating
-            elif new_r > max_rating:
-                new_r = max_rating
-            ratings_ns[idx] = new_r
-            boards_played_ns[idx] += bcount_ns[idx]
-            if bcount_ns[idx] > 0:
-                sessions_ns[idx].add(session_id_value)
-        for idx, d in delta_ew.items():
-            new_r = ratings_ew[idx] + d
-            if new_r < min_rating:
-                new_r = min_rating
-            elif new_r > max_rating:
-                new_r = max_rating
-            ratings_ew[idx] = new_r
-            boards_played_ew[idx] += bcount_ew[idx]
-            if bcount_ew[idx] > 0:
-                sessions_ew[idx].add(session_id_value)
-        _reset_unrated_slot(idx_ns_map, ratings_ns, boards_played_ns, sessions_ns, initial_rating)
-        _reset_unrated_slot(idx_ew_map, ratings_ew, boards_played_ew, sessions_ew, initial_rating)
-
-        # Second pass to record post-commit After / counts / Delta_Before.
-        for i_int in (int(x) for x in rows):
-            idx_n = int(idx_n_arr[i_int])
-            idx_s = int(idx_s_arr[i_int])
-            idx_e = int(idx_e_arr[i_int])
-            idx_w = int(idx_w_arr[i_int])
-            R_N_after[i_int] = ratings_ns[idx_n]
-            R_S_after[i_int] = ratings_ns[idx_s]
-            R_E_after[i_int] = ratings_ew[idx_e]
-            R_W_after[i_int] = ratings_ew[idx_w]
-            N_N[i_int] = len(sessions_ns[idx_n])
-            N_S[i_int] = len(sessions_ns[idx_s])
-            N_E[i_int] = len(sessions_ew[idx_e])
-            N_W[i_int] = len(sessions_ew[idx_w])
-            Elo_Delta_Before[i_int] = ((R_N_Before[i_int] + R_S_Before[i_int]) / 2.0
-                                       - (R_E_Before[i_int] + R_W_Before[i_int]) / 2.0)
+    # Per-session loop, compiled with numba (see _elo_player_kernel).
+    _elo_ensure_jit()
+    _elo_player_kernel(
+        proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes,
+        board_f, idx_n_arr, idx_s_arr, idx_e_arr, idx_w_arr, pct_ns, skip_nan, scale, event_mp_scale,
+        n_ns_slots, n_ew_slots, null_ns, null_ew, max_len,
+        float(initial_rating), float(k_base), int(provisional_boost_until), float(elo_scale),
+        float(score_amplifier), float(min_rating), float(max_rating),
+        float(global_stdev_ns), float(global_stdev_ew), _elo_anchors(),
+        R_N_Before, R_S_Before, R_E_Before, R_W_Before, E_NS, E_EW,
+        R_N_after, R_S_after, R_E_after, R_W_after,
+        N_N, N_S, N_E, N_W,
+        Field_Stdev_NS_Player, Field_Stdev_EW_Player, Field_Mean_NS_Player, Field_Mean_EW_Player,
+    )
 
     # Set ratings to None where session count is below threshold.
     R_N_final = np.where(N_N < minimum_sessions, np.nan, R_N_after)
@@ -4714,7 +4940,7 @@ def compute_player_matchpoint_elo_ratings(
     R_E_before_final = np.where(N_E < minimum_sessions, np.nan, R_E_Before)
     R_W_before_final = np.where(N_W < minimum_sessions, np.nan, R_W_Before)
 
-    out_df = pl.DataFrame({
+    return pl.DataFrame({
         "Elo_R_N_Before": R_N_before_final,
         "Elo_R_E_Before": R_E_before_final,
         "Elo_R_S_Before": R_S_before_final,
@@ -4734,11 +4960,6 @@ def compute_player_matchpoint_elo_ratings(
         "Field_Mean_NS_Player": Field_Mean_NS_Player,
         "Field_Mean_EW_Player": Field_Mean_EW_Player,
     })
-    if replace_existing:
-        cols = [c for c in out_df.columns if c in df_sorted.columns]
-        if cols:
-            df_sorted = df_sorted.drop(cols)
-    return df_sorted.hstack(out_df)
 
 
 def compute_event_start_end_elo_columns(df_sorted: pl.DataFrame) -> pl.DataFrame:
@@ -4890,31 +5111,32 @@ def compute_matchpoint_elo_ratings(
     if 'Pct_NS' not in df.columns:
         df = add_percentage_scores(df)
 
-    # takes 2m30s. Adds 12 columns (incl. Field_Stdev_NS / Field_Stdev_EW).
-    df = compute_pair_matchpoint_elo_ratings(
-        df,
+    # Pair and player Elo are independent: run them in two threads (the numba
+    # kernels release the GIL), then attach columns in the old order (pair
+    # first, then player, whose Elo_E_NS/EW replace the pair ones).
+    common = dict(
         initial_rating=initial_rating,
         k_base=k_base,
         provisional_boost_until=provisional_boost_until,
         minimum_sessions=minimum_sessions,
         elo_scale=elo_scale,
         score_amplifier=score_amplifier,
-        global_stdev_ns=pair_global_stdev_ns,
-        global_stdev_ew=pair_global_stdev_ew,
     )
-
-    # takes 6m. Adds 16 columns (incl. Field_Stdev_NS_Player / Field_Stdev_EW_Player).
-    df = compute_player_matchpoint_elo_ratings(
-        df, # select minimal columns
-        initial_rating=initial_rating,
-        k_base=k_base,
-        provisional_boost_until=provisional_boost_until,
-        minimum_sessions=minimum_sessions,
-        elo_scale=elo_scale,
-        score_amplifier=score_amplifier,
-        global_stdev_ns=player_global_stdev_ns,
-        global_stdev_ew=player_global_stdev_ew,
-    )
+    _elo_ensure_jit()
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        pair_future = ex.submit(
+            _pair_elo_frame, df, **common,
+            global_stdev_ns=pair_global_stdev_ns, global_stdev_ew=pair_global_stdev_ew,
+        )
+        player_future = ex.submit(
+            _player_elo_frame, df, **common,
+            global_stdev_ns=player_global_stdev_ns, global_stdev_ew=player_global_stdev_ew,
+        )
+        pair_out = pair_future.result()
+        player_out = player_future.result()
+    df = _elo_attach(df, pair_out, True)
+    df = _elo_attach(df, player_out, True)
 
     # takes 30s. Adds 12 columns.
     df = compute_event_start_end_elo_columns(

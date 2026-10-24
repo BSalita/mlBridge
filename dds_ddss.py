@@ -173,7 +173,9 @@ def _load_dll() -> bool:
 
             loaded.SetMaxThreads.restype = None
             loaded.SetMaxThreads.argtypes = [ctypes.c_int]
-            loaded.SetMaxThreads(0)
+            # 0 = every core. Multi-process callers set DDSS_MAX_THREADS so
+            # their workers don't each claim every core.
+            loaded.SetMaxThreads(int(os.environ.get("DDSS_MAX_THREADS", "0")))
 
             loaded.ErrorMessage.restype = None
             loaded.ErrorMessage.argtypes = [ctypes.c_int, ctypes.c_char_p]

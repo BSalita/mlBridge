@@ -2171,10 +2171,16 @@ def find_max_horizontal_value(df: pl.DataFrame, pattern: str) -> Tuple[pl.Expr, 
     """
     cols = df.select(pl.col(pattern)).columns
     max_expr = pl.max_horizontal(pl.col(pattern))
-    col_expr = pl.when(pl.col(cols[0]) == max_expr).then(pl.lit(cols[0]))
-    for col in cols[1:]:
-        col_expr = col_expr.when(pl.col(col) == max_expr).then(pl.lit(col))
-    return max_expr, col_expr.otherwise(pl.lit(""))
+    # arg_max picks the first column holding the max, like a when/then chain
+    # over cols would. A chain re-evaluates max_expr once per column (O(cols^2)),
+    # which took minutes for 280 EV columns.
+    idx = pl.concat_list([pl.col(col) for col in cols]).list.arg_max()
+    col_expr = (
+        pl.when(max_expr.is_not_null())
+        .then(idx.replace_strict(list(range(len(cols))), cols, return_dtype=pl.String))
+        .otherwise(pl.lit(""))
+    )
+    return max_expr, col_expr
 # =============================================================================
 # SECTION 5: CONTRACT ANALYSIS FUNCTIONS
 # =============================================================================

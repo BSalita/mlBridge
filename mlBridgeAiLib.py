@@ -955,13 +955,23 @@ def apply_feature_scaling(
     # inplace=True avoids a full-size copy; essential on production-width
     # matrices (~6k cols x millions of rows) where a copy is 100+ GB.
     scaled_data = data if inplace else data.copy()
+    # Broadcast over row blocks instead of 6k strided per-column passes.
+    # mean/std are in the data's dtype, which gives the same result as the
+    # old per-column (column - python_float) / python_float. Features
+    # without params get mean 0 / std 1 (unchanged).
+    means = np.zeros(len(feature_names), dtype=scaled_data.dtype)
+    stds = np.ones(len(feature_names), dtype=scaled_data.dtype)
     for idx, feature in enumerate(feature_names):
         params = scaling_params.get(feature)
         if params is None:
             continue
-        mean = params.get("mean", 0.0)
-        std = params.get("std", 1.0) or 1.0
-        scaled_data[:, idx] = (scaled_data[:, idx] - mean) / std
+        means[idx] = params.get("mean", 0.0)
+        stds[idx] = params.get("std", 1.0) or 1.0
+    block = 65536
+    for start in range(0, scaled_data.shape[0], block):
+        rows = scaled_data[start:start + block]
+        rows -= means
+        rows /= stds
     return scaled_data
 
 
@@ -4280,7 +4290,8 @@ def predict_regression_model(saved_models_path: pathlib.Path, model_name: str, d
     
     # Check input diversity
     if Xc.shape[0] > 1:
-        input_std = Xc.std(dim=0).mean().item()
+        # Evenly spaced row sample; a full Xc.std(dim=0) makes a full-size temporary.
+        input_std = Xc[::max(1, Xc.shape[0] // 100_000)].std(dim=0).mean().item()
         print(f"DEBUG: Input diversity - mean std across features: {input_std:.6f}")
         if input_std < 1e-6:
             print(f"DEBUG: ⚠️  WARNING: Very low input diversity - inputs may be nearly identical")
@@ -4653,7 +4664,10 @@ def predict_classification_model(
         X_num = apply_feature_scaling(X_num, numerical_feature_cols, scaling_params, apply_scaling=True, inplace=True)
     # DEBUG: numeric tensor stats for classification
     try:
-        print(f"DEBUG[CLS] Numeric tensor stats (n={X_num.shape[0]}): mean={np.mean(X_num):.6f}, std={np.std(X_num):.6f}, min={np.min(X_num):.6f}, max={np.max(X_num):.6f}")
+        # Stats on an evenly spaced row sample: on the full club test matrix
+        # (~244 GB) np.std alone allocated another full-size temporary.
+        _s = X_num[::max(1, X_num.shape[0] // 100_000)]
+        print(f"DEBUG[CLS] Numeric tensor stats (n={X_num.shape[0]}, sampled {_s.shape[0]} rows): mean={np.mean(_s):.6f}, std={np.std(_s):.6f}, min={np.min(_s):.6f}, max={np.max(_s):.6f}")
     except Exception:
         pass
     Xc = torch.from_numpy(X_num)

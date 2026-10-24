@@ -4030,7 +4030,7 @@ def _elo_board_field(buf, n, tmp, initial_rating, global_stdev, anchors):
 def _elo_score(pct, i, skip_nan, score_amplifier):
     """NS score for row i, or -1.0 when the row must not update ratings."""
     s = np.float64(pct[i])
-    # The old loop only skipped NaN when Pct_NS came back as float64.
+    # NaN Pct rows are skipped (skip_nan is always True; see _elo_pct_array).
     if skip_nan and np.isnan(s):
         return -1.0
     # Corrupt percentages are skipped, not clamped. NaN falls through.
@@ -4428,16 +4428,18 @@ def _elo_session_layout(df_sorted: pl.DataFrame) -> Tuple[np.ndarray, np.ndarray
 
 
 def _elo_pct_array(df_sorted: pl.DataFrame) -> Tuple[np.ndarray, bool]:
-    """Pct_NS as numpy plus whether NaN rows are skipped.
+    """Pct_NS as numpy plus whether NaN rows are skipped (always, since 2026-10-24).
 
-    The old loop skipped NaN only for float64 values (isinstance(x, float)),
-    so a float32 NaN still reached the update. Kept as is.
+    The old loop skipped NaN only for float64 values (isinstance(x, float)).
+    Pct_NS is float32, so one NaN (or null, which becomes NaN here) reached
+    the update and made every later rating of those players NaN. NaN rows are
+    now skipped like out-of-range ones. Current data has none, so outputs
+    are unchanged.
     """
     pct = df_sorted["Pct_NS"].to_numpy()
-    skip_nan = pct.dtype == np.float64
     if pct.dtype.kind != "f":
         pct = pct.astype(np.float64)
-    return pct, bool(skip_nan)
+    return pct, True
 
 
 def _elo_section_scale(df_sorted: pl.DataFrame, n_rows: int, max_section_pairs: float) -> np.ndarray:

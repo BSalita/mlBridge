@@ -689,6 +689,200 @@ def fill_missing_club_pcts(
     )
 
 
+# ---------------------------------------------------------------------------
+# Board-level pages: deals (``donnes.php``) and pair scorecards
+# (``feuilleroute.php``). Together they give everything a postmortem needs for
+# one pair while ffbridge.fr has not published the session yet.
+# ---------------------------------------------------------------------------
+
+_FR_STRAIN = {"P": "S", "C": "H", "K": "D", "T": "C", "SA": "N"}
+_FR_SEAT = {"N": "N", "E": "E", "S": "S", "O": "W"}
+_FR_RANK = {
+    "A": "A", "R": "K", "D": "Q", "V": "J", "10": "T",
+    "9": "9", "8": "8", "7": "7", "6": "6", "5": "5", "4": "4", "3": "3", "2": "2",
+}
+_SUIT_HOLDING_RE = re.compile(
+    r"images/(pique|coeur|carreau|trefle)\.gif[^>]*>([^<]*)",
+    flags=re.IGNORECASE,
+)
+_CARD_PCT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%")
+_HAND_SUIT_ORDER = ("pique", "coeur", "carreau", "trefle")
+_HAND_CELL_RE = re.compile(
+    r"<td[^>]*>\s*(<img src=images/pique\.gif.*?)</td>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_DEALER_RE = re.compile(r"Donneur:\s*(?:<!Donneur>)?\s*([A-Za-z]+)", flags=re.IGNORECASE)
+_VUL_RE = re.compile(r"Vuln[^:]*:\s*(?:<!Vulnerabilite>)?\s*([^<]+)<", flags=re.IGNORECASE)
+_FREQ_ROW_RE = re.compile(
+    r"<tr[^>]*>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*>([^<]*)</td>\s*<td[^>]*>\s*(\d+)\s*</td>"
+    r"\s*<td[^>]*>\s*([\d.]+)%\s*</td>\s*<td[^>]*>\s*([\d.]+)%\s*</td>\s*</tr>",
+    flags=re.IGNORECASE,
+)
+_PLAYED_RE = re.compile(r"jou(?:&eacute;|é|e)e\s+(\d+)\s+fois", flags=re.IGNORECASE)
+_CARD_ROW_RE = re.compile(r"<tr>(.*?)</tr>", flags=re.IGNORECASE | re.DOTALL)
+_CONTRACT_RE = re.compile(r"^([1-7])(SA|P|C|K|T)\s*(XX|X)?$")
+_PAIR_CODE_RE = re.compile(r"^[a-z]{2}\d{6}([A-Z]{3})([A-Z])(\d+)(NS|EO)$")
+
+
+def deal_url(session_code: str, board: int) -> str:
+    spec = GAMES_BY_PREFIX[session_code[:2].lower()]
+    return f"{BRIDGEINTER_BASE_URL}{spec.directory}/donnes.php?v_codeseance={session_code}&v_donne={int(board)}"
+
+
+def scorecard_url(session_code: str, pair_id: str) -> str:
+    spec = GAMES_BY_PREFIX[session_code[:2].lower()]
+    return f"{BRIDGEINTER_BASE_URL}{spec.directory}/feuilleroute.php?v_numpaire={pair_id}&v_codeseance={session_code}"
+
+
+def parse_pair_code(pair_id: str) -> dict[str, Any]:
+    """``lo261026LEVA04EO`` -> club LEV, section A, table 4, direction EW."""
+    match = _PAIR_CODE_RE.match(pair_id or "")
+    if match is None:
+        raise ValueError(f"Unrecognized BridgeInterNet pair id {pair_id!r}")
+    club, section, table, direction = match.groups()
+    return {
+        "club_code": club,
+        "section": section,
+        "table": int(table),
+        "pair_direction": "NS" if direction == "NS" else "EW",
+    }
+
+
+def _plain(fragment: str) -> str:
+    text = html.unescape(_TAG_RE.sub(" ", fragment)).replace("\xa0", " ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _holding(text: str) -> str:
+    cards = []
+    for token in text.split():
+        if token in {"-", "–", "—"}:
+            continue
+        # Holdings are written run together ("ARDV6", "D10854"); split on ranks.
+        for card in re.findall(r"10|[ARDV98765432]", token):
+            cards.append(_FR_RANK[card])
+    return "".join(cards)
+
+
+def _ns_score(ns_text: str, ew_text: str) -> int:
+    """NS score from the NS / EO score cells; a passed-out board ("PASSE", or both empty) is 0."""
+    for text, sign in ((ns_text, 1), (ew_text, -1)):
+        if not text or normalize_text(text).startswith("PASS"):
+            continue
+        return sign * int(text)
+    return 0
+
+
+def _vulnerability(name: str) -> str:
+    folded = normalize_text(name)
+    if folded.startswith("PERSONNE") or folded.startswith("AUCUN"):
+        return "None"
+    if folded.startswith("NORD") or folded.startswith("NS"):
+        return "N_S"
+    if folded.startswith("EST") or folded.startswith("EO"):
+        return "E_W"
+    if folded.startswith("TOUS"):
+        return "Both"
+    raise ValueError(f"Unrecognized vulnerability {name!r}")
+
+
+def parse_deal_page(page_html: str) -> dict[str, Any]:
+    """Dealer, vulnerability, the four hands as PBN, and the field's score frequencies."""
+    dealer_match = _DEALER_RE.search(page_html)
+    vul_match = _VUL_RE.search(page_html)
+    if dealer_match is None or vul_match is None:
+        raise ValueError("BridgeInterNet deal page has no dealer or vulnerability")
+    dealer = {"NORD": "N", "EST": "E", "SUD": "S", "OUEST": "W"}[normalize_text(dealer_match.group(1))]
+    cells = _HAND_CELL_RE.findall(page_html)
+    if len(cells) < 4:
+        raise ValueError(f"BridgeInterNet deal page has {len(cells)} hands, expected 4")
+    hands = []
+    for cell in cells[:4]:
+        suits = {name.lower(): _holding(_plain(raw)) for name, raw in _SUIT_HOLDING_RE.findall(cell)}
+        if set(suits) != set(_HAND_SUIT_ORDER):
+            raise ValueError(f"BridgeInterNet hand is missing a suit: {sorted(suits)}")
+        hand = ".".join(suits[name] for name in _HAND_SUIT_ORDER)
+        if sum(len(part) for part in hand.split(".")) != 13:
+            raise ValueError(f"BridgeInterNet hand does not have 13 cards: {hand}")
+        hands.append(hand)
+    # The page draws North, then West and East on one row, then South.
+    north, west, east, south = hands
+    frequencies = []
+    for ns_text, ew_text, count, ns_pct, ew_pct in _FREQ_ROW_RE.findall(page_html):
+        score = _ns_score(_plain(ns_text), _plain(ew_text))
+        frequencies.append(
+            {"score_ns": score, "count": int(count), "pct_ns": float(ns_pct), "pct_ew": float(ew_pct)}
+        )
+    played_match = _PLAYED_RE.search(page_html)
+    played = int(played_match.group(1)) if played_match else sum(row["count"] for row in frequencies)
+    return {
+        "dealer": dealer,
+        "vul": _vulnerability(vul_match.group(1)),
+        "pbn": f"N:{north} {east} {south} {west}",
+        "frequencies": frequencies,
+        "played": played,
+    }
+
+
+def _lead_code(text: str) -> Optional[str]:
+    compact = text.replace(" ", "").upper()
+    match = re.fullmatch(r"(10|[ARDV98765432])([PCKT])", compact)
+    if match is None:
+        return None
+    return _FR_RANK[match.group(1)] + _FR_STRAIN[match.group(2)]
+
+
+def contract_fields(contract: str, declarer: str, result: str) -> dict[str, Any]:
+    """French scorecard cells to mlBridge Contract/Declarer/Result (``4SXN``, ``N``, ``-1``)."""
+    text = contract.replace(" ", "").upper()
+    if text.startswith("PASS"):
+        return {"Contract": "PASS", "Declarer": None, "Result": None}
+    match = _CONTRACT_RE.match(text)
+    if match is None:
+        raise ValueError(f"Unrecognized BridgeInterNet contract {contract!r}")
+    seat = _FR_SEAT.get(declarer.strip().upper())
+    if seat is None:
+        raise ValueError(f"Unrecognized BridgeInterNet declarer {declarer!r}")
+    level, strain, penalty = match.groups()
+    result_text = result.replace(" ", "")
+    tricks = 0 if result_text == "=" else int(result_text)
+    return {
+        "Contract": f"{level}{_FR_STRAIN[strain]}{penalty or ''}{seat}",
+        "Declarer": seat,
+        "Result": tricks,
+    }
+
+
+def parse_scorecard(page_html: str) -> dict[str, Any]:
+    """One pair's scorecard: each board's contract, lead, NS score, the pair's % and opponents."""
+    boards = []
+    opponents = None
+    for row_html in _CARD_ROW_RE.findall(page_html):
+        cells = [_plain(cell) for cell in _TD_RE.findall(row_html)]
+        if len(cells) != 9 or not cells[0].isdigit():
+            continue
+        board, contract, declarer, lead, result, ns_text, ew_text, pct_text, opp = cells
+        pct_match = _CARD_PCT_RE.search(pct_text)
+        if pct_match is None:
+            raise ValueError(f"Board {board} percentage {pct_text!r} was not parsed")
+        if opp:
+            opponents = opp
+        score_ns = _ns_score(ns_text, ew_text)
+        boards.append(
+            {
+                "board": int(board),
+                **contract_fields(contract, declarer, result),
+                "lead": _lead_code(lead),
+                "score_ns": score_ns,
+                "pct": float(pct_match.group(1)),
+                "opponents": opponents,
+            }
+        )
+    if not boards:
+        raise ValueError("BridgeInterNet scorecard has no board results")
+    return {"boards": boards}
+
+
 if __name__ == "__main__":
     import argparse
 

@@ -24,7 +24,10 @@
 # Rename to title case for column names. e.g. session_id to Session_ID
 # change Number_Declarer to Declarer or Declarer_ID or Player_ID_Declarer. Same with Declarer_Name or Player_Name_Declarer. Same with OnLead or OnLead_ID or Player_ID_OnLead.
 
+import hashlib
+import os
 import pathlib
+import uuid
 import polars as pl
 import numpy as np
 import warnings
@@ -2736,6 +2739,424 @@ def add_dd_tricks_dummy_column(df: pl.DataFrame) -> pl.DataFrame:
             pl.UInt8,
         ).alias('DD_Tricks_Dummy')
     )
+
+
+_LEAD_SOLVE_CHUNK = 50_000
+_LEFT_OF_DECLARER = {'N': 'E', 'E': 'S', 'S': 'W', 'W': 'N'}
+_LEAD_KEYS = ('PBN', '_Lead_BidSuit', '_Lead_Leader')
+
+
+def _with_lead_keys(df: pl.DataFrame) -> pl.DataFrame:
+    """Add _Lead_Leader (seat after declarer), _Lead_Card ("HK"; null if unreadable)
+    and _Lead_BidSuit (BidSuit as text). Callers drop them when done."""
+    return df.with_columns(
+        pl.col('Declarer_Direction').cast(pl.String)
+            .replace_strict(_LEFT_OF_DECLARER, default=None, return_dtype=pl.String)
+            .alias('_Lead_Leader'),
+        pl.col('Lead').cast(pl.String).str.strip_chars().str.to_uppercase()
+            .str.replace('10', 'T', literal=True)
+            .alias('_Lead_Card'),
+        pl.col('BidSuit').cast(pl.String).alias('_Lead_BidSuit'),
+    ).with_columns(
+        pl.when(pl.col('_Lead_Card').str.contains(r'^[SHDC][2-9TJQKA]$'))
+            .then(pl.col('_Lead_Card'))
+            .otherwise(None)
+            .alias('_Lead_Card')
+    )
+
+
+def add_dd_lead_cost(df: pl.DataFrame) -> pl.DataFrame:
+    """Score each opening lead double dummy.
+
+    Purpose:
+    - Measure how many tricks the actual opening lead gave away, double dummy
+    - Flag leads that were as good as the best double-dummy lead
+
+    Parameters:
+    - df: board results with the deal, the contract and the opening lead
+
+    Returns:
+    - pl.DataFrame: Input DataFrame with the two columns below added
+
+    Input columns:
+    - 'PBN': Full deal ("N:...")
+    - 'BidSuit': Contract strain (S/H/D/C/N); null for a passed-out board
+    - 'Declarer_Direction': Declarer seat (N/E/S/W); the leader is the next seat
+    - 'Lead': Opening lead as suit then rank ("HK", "S9"). "S10" is read as "ST"
+
+    Output columns:
+    - 'DD_Lead_Cost' (UInt8): defenders' tricks with the best DD lead minus their
+      tricks after the actual lead. Null when there is no lead, no contract, or
+      the recorded lead is not a card the leader holds (usually a scoring error
+      in the declarer seat).
+    - 'Lead_Is_DD_Best' (Boolean): DD_Lead_Cost == 0, null where it is null.
+
+    Notes:
+    - One ddss SolveBoard (all cards scored) per unique (PBN, strain, leader).
+    """
+    for col in ('PBN', 'BidSuit', 'Declarer_Direction', 'Lead'):
+        assert col in df.columns, f"Required column '{col}' not found in DataFrame"
+    assert 'DD_Lead_Cost' not in df.columns, "Column 'DD_Lead_Cost' already exists"
+    assert 'Lead_Is_DD_Best' not in df.columns, "Column 'Lead_Is_DD_Best' already exists"
+    if not _DDSS_AVAILABLE:
+        raise RuntimeError("add_dd_lead_cost needs the ddss DLL (SolveAllBoards)")
+
+    df = _with_lead_keys(df)
+    keys = list(_LEAD_KEYS)
+    # Unique positions, each with the distinct cards led from it.
+    wanted = (
+        df.filter(
+            pl.col('_Lead_Card').is_not_null()
+            & pl.col('_Lead_BidSuit').is_in(list('SHDCN'))
+            & pl.col('_Lead_Leader').is_not_null()
+            & pl.col('PBN').is_not_null()
+        )
+        .select(*keys, '_Lead_Card')
+        .unique()
+        .group_by(keys)
+        .agg(pl.col('_Lead_Card'))
+    )
+    positions = wanted.select(keys).rows()
+    led_cards = wanted['_Lead_Card'].to_list()
+    logger.info(f"Opening leads to solve: {len(positions)} unique (PBN, strain, leader)")
+
+    rows: Dict[str, list] = {k: [] for k in (*keys, '_Lead_Card', '_Lead_Cost')}
+    t = time.time()
+    for start in range(0, len(positions), _LEAD_SOLVE_CHUNK):
+        chunk = positions[start:start + _LEAD_SOLVE_CHUNK]
+        solved = _dds_ddss.solve_opening_leads(chunk)
+        for (pbn, strain, leader), cards, tricks in zip(chunk, led_cards[start:start + _LEAD_SOLVE_CHUNK], solved):
+            best = max(tricks.values())
+            for card in cards:
+                if card not in tricks:  # leader does not hold it
+                    continue
+                rows['PBN'].append(pbn)
+                rows['_Lead_BidSuit'].append(strain)
+                rows['_Lead_Leader'].append(leader)
+                rows['_Lead_Card'].append(card)
+                rows['_Lead_Cost'].append(best - tricks[card])
+        done = min(start + _LEAD_SOLVE_CHUNK, len(positions))
+        logger.info(f"Opening leads solved: {done} of {len(positions)} ({time.time() - t:.0f}s)")
+
+    costs = pl.DataFrame(rows, schema={k: pl.String for k in (*keys, '_Lead_Card')} | {'_Lead_Cost': pl.UInt8})
+    df = (
+        df.join(costs, on=[*keys, '_Lead_Card'], how='left', maintain_order='left')
+        .rename({'_Lead_Cost': 'DD_Lead_Cost'})
+        .with_columns((pl.col('DD_Lead_Cost') == 0).alias('Lead_Is_DD_Best'))
+        .drop('_Lead_Leader', '_Lead_Card', '_Lead_BidSuit')
+    )
+    with_lead = df.select(pl.col('Lead').is_not_null() & (pl.col('Lead').cast(pl.String).str.strip_chars() != '')).to_series().sum()
+    scored = df['DD_Lead_Cost'].is_not_null().sum()
+    logger.info(f"DD_Lead_Cost: {scored} of {with_lead} rows with a lead scored; "
+                f"{with_lead - scored} leads not held by the leader or unreadable")
+    return df
+
+
+# --- Single-dummy opening lead -------------------------------------------------
+# The leader sees 13 cards. Deal the other 39 at random (in 'contract' mode keeping
+# the declaring side's combined HCP within SD_LEAD_HCP_WINDOW and its trump length
+# as dealt, a stand-in for what the auction shows), solve every lead on each layout,
+# and compare the actual lead with the best one. Every lead is scored on the same
+# layouts, so differences between leads are much less noisy than the averages.
+
+SD_LEAD_MODES = ('hand', 'contract')
+SD_LEAD_DEFAULT_SAMPLES = 20
+SD_LEAD_HCP_WINDOW = 2
+SD_LEAD_MAX_SHUFFLES = 200_000  # per position; fewer accepted layouts -> null score
+SD_LEAD_BEST_TOLERANCE = 0.05  # tricks; SD_Lead_Is_Best when the cost is below this
+_SD_LEAD_SOLVE_POSITIONS = 2_000  # positions per ddss batch (x samples boards)
+_RANKS = 'AKQJT98765432'
+_CARD_SUIT = np.repeat(np.arange(4, dtype=np.int8), 13)  # card id -> suit index (SHDC)
+_CARD_HCP = np.tile(np.array([4, 3, 2, 1] + [0] * 9, dtype=np.int8), 4)
+_CARD_TEXT = [suit + rank for suit in 'SHDC' for rank in _RANKS]
+_CARD_ID = {text: i for i, text in enumerate(_CARD_TEXT)}
+
+
+def _pbn_hands(pbn: str) -> list[list[int]]:
+    """Card ids (suit * 13 + rank index, A=0) of N, E, S, W from an "N:..." deal."""
+    if not pbn.startswith('N:'):
+        raise ValueError(f"PBN must start with 'N:': {pbn!r}")
+    hands = []
+    for hand in pbn[2:].split():
+        suits = hand.split('.')
+        if len(suits) != 4:
+            raise ValueError(f"Bad hand {hand!r} in {pbn!r}")
+        hands.append([s * 13 + _RANKS.index(c) for s, holding in enumerate(suits) for c in holding])
+    if len(hands) != 4 or sorted(c for h in hands for c in h) != list(range(52)):
+        raise ValueError(f"PBN is not a full deal: {pbn!r}")
+    return hands
+
+
+def _hands_pbn(hands: list) -> str:
+    out = []
+    for cards in hands:
+        suits: list = [[], [], [], []]
+        for c in sorted(cards):
+            suits[c // 13].append(_RANKS[c % 13])
+        out.append('.'.join(''.join(s) for s in suits))
+    return 'N:' + ' '.join(out)
+
+
+def _sd_lead_seed(pbn: str, strain: str, leader: str) -> int:
+    return int.from_bytes(hashlib.sha1(f"{pbn}|{strain}|{leader}".encode()).digest()[:8], 'big')
+
+
+def sample_lead_layouts(pbn: str, strain: str, leader: str, samples: int, mode: str = 'contract',
+                        max_shuffles: int = SD_LEAD_MAX_SHUFFLES) -> Optional[list[str]]:
+    """Layouts the leader cannot tell from the real one, as "N:..." deals.
+
+    The leader's hand is kept. 'hand' deals the other 39 cards freely; 'contract'
+    also keeps the declaring side's combined HCP within SD_LEAD_HCP_WINDOW of the
+    real deal and, in a suit contract, its combined trump length. Seeded from the
+    position, so the same position always gets the same layouts. Returns None when
+    fewer than `samples` layouts pass within `max_shuffles` tries.
+    """
+    if mode not in SD_LEAD_MODES:
+        raise ValueError(f"mode must be one of {SD_LEAD_MODES}, got {mode!r}")
+    hands = _pbn_hands(pbn)
+    li = 'NESW'.index(leader)
+    partner, declarer, dummy = (li + 2) % 4, (li + 3) % 4, (li + 1) % 4
+    rest = np.array(hands[partner] + hands[declarer] + hands[dummy], dtype=np.int8)
+    side = rest[13:]  # declarer + dummy
+    side_hcp = int(_CARD_HCP[side].sum())
+    trump = None if strain == 'N' else 'SHDC'.index(strain)
+    side_trumps = None if trump is None else int((_CARD_SUIT[side] == trump).sum())
+    rng = np.random.default_rng(_sd_lead_seed(pbn, strain, leader))
+    batch = max(64, samples * 8)
+    accepted: list = []
+    tried = 0
+    while len(accepted) < samples and tried < max_shuffles:
+        perm = rng.permuted(np.tile(rest, (batch, 1)), axis=1)
+        tried += batch
+        if mode == 'contract':
+            dealt = perm[:, 13:]
+            ok = np.abs(_CARD_HCP[dealt].sum(axis=1) - side_hcp) <= SD_LEAD_HCP_WINDOW
+            if trump is not None:
+                ok &= (_CARD_SUIT[dealt] == trump).sum(axis=1) == side_trumps
+            perm = perm[ok]
+        accepted.extend(perm[: samples - len(accepted)])
+    if len(accepted) < samples:
+        return None
+    layouts = []
+    for p in accepted:
+        new = [None, None, None, None]
+        new[li] = hands[li]
+        new[partner] = p[:13].tolist()
+        new[declarer] = p[13:26].tolist()
+        new[dummy] = p[26:].tolist()
+        layouts.append(_hands_pbn(new))
+    return layouts
+
+
+class SDLeadCache:
+    """Sampled lead results per (PBN, strain, leader) for add_sd_lead_score.
+
+    Each entry is samples x 13 defensive-trick counts (UInt8 bytes, sample-major,
+    the leader's cards in suit/rank order), or b'' when sampling failed. With a
+    directory, entries are kept as parquet parts there: loaded once, new entries
+    written as a new part every `flush_every` positions and by flush(). Without
+    one, entries live in memory only. Entries with another sample count or mode
+    are ignored, so changing either re-solves.
+    """
+
+    _SCHEMA = {'PBN': pl.String, 'BidSuit': pl.String, 'Leader': pl.String,
+               'Mode': pl.String, 'Samples': pl.UInt16, 'Tricks': pl.Binary}
+
+    def __init__(self, samples: int = SD_LEAD_DEFAULT_SAMPLES, mode: str = 'contract',
+                 directory: Optional[pathlib.Path] = None, flush_every: int = 20_000):
+        if not 1 <= samples <= 1000:
+            raise ValueError(f"samples must be 1..1000, got {samples}")
+        if mode not in SD_LEAD_MODES:
+            raise ValueError(f"mode must be one of {SD_LEAD_MODES}, got {mode!r}")
+        self.samples = samples
+        self.mode = mode
+        self.directory = pathlib.Path(directory) if directory is not None else None
+        self.flush_every = flush_every
+        self._entries: Optional[dict] = None
+        self._pending: dict = {}
+
+    def _load(self) -> dict:
+        if self._entries is None:
+            self._entries = {}
+            parts = sorted(self.directory.glob('part-*.parquet')) if self.directory and self.directory.is_dir() else []
+            if parts:
+                t = time.time()
+                table = (pl.scan_parquet(parts)
+                         .filter((pl.col('Mode') == self.mode) & (pl.col('Samples') == self.samples))
+                         .select('PBN', 'BidSuit', 'Leader', 'Tricks').collect())
+                for pbn, strain, leader, tricks in table.iter_rows():
+                    self._entries[(pbn, strain, leader)] = tricks
+                logger.info(f"SD lead cache: {len(self._entries)} positions at {self.samples} samples "
+                            f"({self.mode}) from {len(parts)} parts ({time.time() - t:.0f}s)")
+        return self._entries
+
+    def get(self, key: tuple) -> Optional[bytes]:
+        entries = self._load()
+        return entries.get(key, self._pending.get(key))
+
+    def __contains__(self, key: tuple) -> bool:
+        return key in self._load() or key in self._pending
+
+    def add(self, key: tuple, tricks: bytes) -> None:
+        self._pending[key] = tricks
+        if self.directory is not None and len(self._pending) >= self.flush_every:
+            self.flush()
+
+    def flush(self) -> None:
+        """Write pending entries as one new part (memory-only caches just keep them)."""
+        if not self._pending:
+            return
+        entries = self._load()
+        if self.directory is not None:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            keys = list(self._pending)
+            part = pl.DataFrame({
+                'PBN': [k[0] for k in keys], 'BidSuit': [k[1] for k in keys], 'Leader': [k[2] for k in keys],
+                'Mode': [self.mode] * len(keys), 'Samples': [self.samples] * len(keys),
+                'Tricks': [self._pending[k] for k in keys],
+            }, schema=self._SCHEMA)
+            name = f"part-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}.parquet"
+            tmp = self.directory / f".{name}.tmp"
+            part.write_parquet(tmp)
+            os.replace(tmp, self.directory / name)
+        entries.update(self._pending)
+        self._pending = {}
+
+
+def _solve_sd_lead_positions(positions: list, samples: int, mode: str) -> list:
+    """Sample-major trick bytes (or b'') for each (pbn, strain, leader) position."""
+    boards: list = []
+    owners: list = []
+    for i, (pbn, strain, leader) in enumerate(positions):
+        layouts = sample_lead_layouts(pbn, strain, leader, samples, mode)
+        if layouts is not None:
+            owners.append(i)
+            boards.extend((layout, strain, leader) for layout in layouts)
+    solved = _dds_ddss.solve_opening_leads(boards) if boards else []
+    out = [b''] * len(positions)
+    for k, i in enumerate(owners):
+        pbn, strain, leader = positions[i]
+        cards = sorted(_pbn_hands(pbn)['NESW'.index(leader)])
+        flat = bytearray()
+        for tricks in solved[k * samples:(k + 1) * samples]:
+            flat.extend(tricks[_CARD_TEXT[c]] for c in cards)
+        out[i] = bytes(flat)
+    return out
+
+
+def add_sd_lead_score(df: pl.DataFrame, cache: SDLeadCache) -> pl.DataFrame:
+    """Score each opening lead single dummy: from the leader's own hand, not the layout.
+
+    Purpose:
+    - Judge the lead on what the leader could see, unlike DD_Lead_Cost
+    - Separate a bad lead from an unlucky one (SD_Lead_Luck)
+
+    Parameters:
+    - df: board results after add_dd_lead_cost
+    - cache: SDLeadCache; sets the sample count and mode and keeps solved positions.
+      The caller flushes it when the run ends.
+
+    Returns:
+    - pl.DataFrame: Input DataFrame with the columns below added
+
+    Input columns:
+    - 'PBN', 'BidSuit', 'BidLvl', 'Declarer_Direction', 'Lead'
+    - 'DD_Tricks': declarer's DD tricks in the contract strain
+    - 'DD_Lead_Cost': only rows where it is set are scored
+
+    Output columns (null where DD_Lead_Cost is null or sampling failed):
+    - 'SD_Lead_Tricks' (Float32): average defensive tricks after the actual lead
+    - 'SD_Lead_Best_Tricks' (Float32): the same for the best lead
+    - 'SD_Lead_Cost' (Float32): best minus actual
+    - 'SD_Lead_Is_Best' (Boolean): SD_Lead_Cost < SD_LEAD_BEST_TOLERANCE
+    - 'SD_Lead_Best_Card' (String): the best lead, e.g. "HK"
+    - 'SD_Lead_Rank' (UInt8): 1 + number of the leader's cards with a higher average
+    - 'SD_Lead_Set_Pct' (Float32): fraction of layouts where the actual lead defeats the contract
+    - 'SD_Lead_Best_Set_Pct' (Float32): highest such fraction over all leads
+    - 'SD_Lead_Set_Cost' (Float32): best minus actual set fraction
+    - 'SD_Lead_Luck' (Float32): defensive tricks after the actual lead on the real
+      layout (double dummy) minus SD_Lead_Tricks; positive means the layout helped
+    - 'SD_Lead_Samples' (UInt16): layouts used
+    """
+    required = ('PBN', 'BidSuit', 'BidLvl', 'Declarer_Direction', 'Lead', 'DD_Tricks', 'DD_Lead_Cost')
+    for col in required:
+        assert col in df.columns, f"Required column '{col}' not found in DataFrame"
+    assert 'SD_Lead_Cost' not in df.columns, "Column 'SD_Lead_Cost' already exists"
+    if not _DDSS_AVAILABLE:
+        raise RuntimeError("add_sd_lead_score needs the ddss DLL (SolveAllBoards)")
+    samples = cache.samples
+    keys = list(_LEAD_KEYS)
+    df = _with_lead_keys(df).with_columns(pl.col('BidLvl').cast(pl.Int64).alias('_Lead_Level'))
+    scored = df.filter(pl.col('DD_Lead_Cost').is_not_null())
+    positions = scored.select(keys).unique().rows()
+    todo = [p for p in positions if p not in cache]
+    logger.info(f"SD lead: {len(positions)} positions, {len(todo)} to solve at {samples} samples ({cache.mode})")
+    t = time.time()
+    for start in range(0, len(todo), _SD_LEAD_SOLVE_POSITIONS):
+        chunk = todo[start:start + _SD_LEAD_SOLVE_POSITIONS]
+        for key, tricks in zip(chunk, _solve_sd_lead_positions(chunk, samples, cache.mode)):
+            cache.add(key, tricks)
+        done = start + len(chunk)
+        rate = done / max(time.time() - t, 1e-9)
+        logger.info(f"SD lead solved {done} of {len(todo)} positions ({rate:.1f}/s, "
+                    f"ETA {(len(todo) - done) / rate / 60:.0f} min)")
+
+    stats: Dict[str, list] = {k: [] for k in (*keys, '_Lead_Level', '_Lead_Card', 'SD_Lead_Tricks',
+                                                'SD_Lead_Best_Tricks', 'SD_Lead_Best_Card', 'SD_Lead_Rank',
+                                                'SD_Lead_Set_Pct', 'SD_Lead_Best_Set_Pct')}
+    memo: dict = {}
+    failed = 0
+    for pbn, strain, leader, level, card in scored.select(*keys, '_Lead_Level', '_Lead_Card').unique().iter_rows():
+        key = (pbn, strain, leader)
+        if key not in memo:
+            blob = cache.get(key)
+            if not blob:
+                memo[key] = None
+            else:
+                tricks = np.frombuffer(blob, dtype=np.uint8).reshape(samples, 13)
+                cards = sorted(_pbn_hands(pbn)['NESW'.index(leader)])
+                memo[key] = (tricks, tricks.mean(axis=0), {c: i for i, c in enumerate(cards)}, cards)
+        if memo[key] is None:
+            failed += 1
+            continue
+        tricks, means, index, cards = memo[key]
+        i = index[_CARD_ID[card]]
+        best = int(np.argmax(means))
+        set_pct = (tricks >= 8 - level).mean(axis=0)  # defenders need 8 - level tricks
+        for name, value in zip(keys, key):
+            stats[name].append(value)
+        stats['_Lead_Level'].append(level)
+        stats['_Lead_Card'].append(card)
+        stats['SD_Lead_Tricks'].append(float(means[i]))
+        stats['SD_Lead_Best_Tricks'].append(float(means[best]))
+        stats['SD_Lead_Best_Card'].append(_CARD_TEXT[cards[best]])
+        stats['SD_Lead_Rank'].append(1 + int((means > means[i] + 1e-9).sum()))
+        stats['SD_Lead_Set_Pct'].append(float(set_pct[i]))
+        stats['SD_Lead_Best_Set_Pct'].append(float(set_pct.max()))
+    if failed:
+        logger.info(f"SD lead: {failed} lead/level combinations unscored (too few layouts passed the constraints)")
+
+    schema = {k: pl.String for k in (*keys, '_Lead_Card', 'SD_Lead_Best_Card')} | {
+        '_Lead_Level': pl.Int64, 'SD_Lead_Rank': pl.UInt8,
+        'SD_Lead_Tricks': pl.Float32, 'SD_Lead_Best_Tricks': pl.Float32,
+        'SD_Lead_Set_Pct': pl.Float32, 'SD_Lead_Best_Set_Pct': pl.Float32}
+    stats_df = pl.DataFrame(stats, schema=schema)
+    df = (
+        df.join(stats_df, on=[*keys, '_Lead_Level', '_Lead_Card'], how='left', maintain_order='left')
+        .with_columns(
+            (pl.col('SD_Lead_Best_Tricks') - pl.col('SD_Lead_Tricks')).alias('SD_Lead_Cost'),
+            (pl.col('SD_Lead_Best_Set_Pct') - pl.col('SD_Lead_Set_Pct')).alias('SD_Lead_Set_Cost'),
+            (13 - pl.col('DD_Tricks').cast(pl.Float32) - pl.col('DD_Lead_Cost').cast(pl.Float32)
+             - pl.col('SD_Lead_Tricks')).alias('SD_Lead_Luck'),
+            pl.when(pl.col('SD_Lead_Tricks').is_not_null()).then(pl.lit(samples, dtype=pl.UInt16))
+              .otherwise(None).alias('SD_Lead_Samples'),
+        )
+        .with_columns((pl.col('SD_Lead_Cost') < SD_LEAD_BEST_TOLERANCE).alias('SD_Lead_Is_Best'))
+        .drop('_Lead_Leader', '_Lead_Card', '_Lead_BidSuit', '_Lead_Level')
+    )
+    logger.info(f"SD lead: {df['SD_Lead_Cost'].is_not_null().sum()} of "
+                f"{scored.height} DD-scored leads scored ({time.time() - t:.0f}s)")
+    return df
 
 
 # todo: implement this
@@ -7285,8 +7706,9 @@ def create_result_columns(df: pl.DataFrame) -> pl.DataFrame:
 
 
 class FinalContractAugmenter:
-    def __init__(self, df: pl.DataFrame):
+    def __init__(self, df: pl.DataFrame, sd_lead: Optional[SDLeadCache] = None):
         self.df = df
+        self.sd_lead = sd_lead  # None: no single-dummy lead score
         # note that polars exprs are allowed in dict values.
         self.get_vulnerability_conditions = {
             'NS': pl.col('Vul').is_in(['N_S', 'Both']),
@@ -7471,6 +7893,15 @@ class FinalContractAugmenter:
         # Assert columns were created
         assert 'DD_Score_Declarer' in self.df.columns, "Column 'DD_Score_Declarer' was not created"
 
+    def _score_opening_leads(self) -> None:
+        # Only sources that record the opening lead (ACBL club, FFBridge) get these columns.
+        if 'Lead' not in self.df.columns:
+            logger.info("Skipping DD_Lead_Cost - no 'Lead' column")
+            return
+        self.df = self._time_operation("add_dd_lead_cost", add_dd_lead_cost, self.df)
+        if self.sd_lead is not None:
+            self.df = self._time_operation("add_sd_lead_score", add_sd_lead_score, self.df, self.sd_lead)
+
     def _compute_expected_values(self) -> None:
         # Assert required columns exist - scores_df and probability columns needed
         # Check for existence of probability columns (sample check)
@@ -7601,8 +8032,12 @@ class FinalContractAugmenter:
         self._derive_contract_results()
         self._add_score_calculations()
         self._add_double_dummy_analysis() # 1m30s
+        self._score_opening_leads()
         self._compute_expected_values() # 2s
         self._compute_scoring_differentials()
+        if 'SC_Guess_NS' in self.df.columns:  # hand records were augmented with SuitC
+            from mlBridge import mlBridgeSuitCLib
+            self.df = mlBridgeSuitCLib.add_suitc_declarer_columns(self.df)
         self._apply_law_of_total_tricks() # 7s # todo: would be interesting to create lott for all contracts and then move into AllContractsAugmenter
         #self._perform_legacy_renames() # 6s
         self._derive_positional_roles() # 1m30s
@@ -7923,8 +8358,11 @@ class AllHandRecordAugmentations:
                  output_progress: Optional[bool] = True,
                  progress: Optional[Any] = None,
                  lock_func: Optional[Callable[..., pl.DataFrame]] = None,
-                 cache_file_path: Optional[pathlib.Path] = None):
+                 cache_file_path: Optional[pathlib.Path] = None,
+                 suitc: Optional[Any] = None):
         """Initialize the AllAugmentations class with a DataFrame and optional parameters.
+
+        suitc: mlBridgeSuitCLib.SuitCCache; adds the SC_* single-suit columns when given.
         
         Args:
             df: The input DataFrame to augment
@@ -7946,6 +8384,7 @@ class AllHandRecordAugmentations:
         self.progress = progress
         self.lock_func = lock_func
         self.cache_file_path = cache_file_path
+        self.suitc = suitc
 
         # instance initialization
 
@@ -8000,6 +8439,13 @@ class AllHandRecordAugmentations:
         result_augmenter = HandAugmenter(self.df)
         self.df = result_augmenter.perform_hand_augmentations()
 
+        # Step 2b: SuitC single-suit, single-dummy columns (opt-in)
+        if self.suitc is not None:
+            from mlBridge import mlBridgeSuitCLib
+            t = time.time()
+            self.df = mlBridgeSuitCLib.add_suitc_features(self.df, self.suitc)
+            logger.info(f"add_suitc_features: time:{time.time()-t} seconds")
+
         # Step 3: Double dummy and single dummy augmentations
         dd_sd_augmenter = DD_SD_Augmenter(
             self.df, 
@@ -8041,9 +8487,10 @@ class AllHandRecordAugmentations:
 
 
 class AllBoardResultsAugmentations:
-    def __init__(self, df: pl.DataFrame, incorporate_elo_ratings: bool = False):
+    def __init__(self, df: pl.DataFrame, incorporate_elo_ratings: bool = False, sd_lead: Optional[SDLeadCache] = None):
         self.df = df
         self.incorporate_elo_ratings = incorporate_elo_ratings
+        self.sd_lead = sd_lead
 
 
     def perform_all_board_results_augmentations(self) -> pl.DataFrame:
@@ -8057,7 +8504,7 @@ class AllBoardResultsAugmentations:
         logger.info(f"Starting all board results augmentations on DataFrame with {len(self.df)} rows")
         
         # Step 5: Final contract augmentations
-        hand_augmenter = FinalContractAugmenter(self.df)
+        hand_augmenter = FinalContractAugmenter(self.df, sd_lead=self.sd_lead)
         self.df = hand_augmenter.perform_final_contract_augmentations()
         
         # Step 6: Matchpoint augmentations
@@ -8074,8 +8521,10 @@ class AllBoardResultsAugmentations:
 
 
 class AllAugmentations:
-    def __init__(self, df: pl.DataFrame, hrs_cache_df: Optional[pl.DataFrame] = None, sd_productions: int = 40, max_dd_adds: Optional[int] = None, max_sd_adds: Optional[int] = None, output_progress: Optional[bool] = True, progress: Optional[Any] = None, lock_func: Optional[Callable[..., pl.DataFrame]] = None, incorporate_elo_ratings: bool = False):
+    def __init__(self, df: pl.DataFrame, hrs_cache_df: Optional[pl.DataFrame] = None, sd_productions: int = 40, max_dd_adds: Optional[int] = None, max_sd_adds: Optional[int] = None, output_progress: Optional[bool] = True, progress: Optional[Any] = None, lock_func: Optional[Callable[..., pl.DataFrame]] = None, incorporate_elo_ratings: bool = False, sd_lead: Optional[SDLeadCache] = None, suitc: Optional[Any] = None):
         self.df = df
+        self.sd_lead = sd_lead
+        self.suitc = suitc
         self.hrs_cache_df = hrs_cache_df
         self.sd_productions = sd_productions
         self.max_dd_adds = max_dd_adds
@@ -8094,9 +8543,9 @@ class AllAugmentations:
         t_start = time.time()
         logger.info(f"Starting all augmentations on DataFrame with {len(self.df)} rows")
 
-        hand_record_augmenter = AllHandRecordAugmentations(self.df, self.hrs_cache_df, self.sd_productions, self.max_dd_adds, self.max_sd_adds, self.output_progress, self.progress, self.lock_func)
+        hand_record_augmenter = AllHandRecordAugmentations(self.df, self.hrs_cache_df, self.sd_productions, self.max_dd_adds, self.max_sd_adds, self.output_progress, self.progress, self.lock_func, suitc=self.suitc)
         self.df, self.hrs_cache_df = hand_record_augmenter.perform_all_hand_record_augmentations()
-        board_results_augmenter = AllBoardResultsAugmentations(self.df, incorporate_elo_ratings=self.incorporate_elo_ratings)
+        board_results_augmenter = AllBoardResultsAugmentations(self.df, incorporate_elo_ratings=self.incorporate_elo_ratings, sd_lead=self.sd_lead)
         self.df = board_results_augmenter.perform_all_board_results_augmentations()
 
         logger.info(f"All augmentations completed in {time.time() - t_start:.2f} seconds")

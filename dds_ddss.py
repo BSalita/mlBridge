@@ -86,6 +86,49 @@ class parResults(ctypes.Structure):
     ]
 
 
+# SolveAllBoards structs (include/dll.h). ddss raises MAXNOOFBOARDS to
+# MAXNOOFTABLES * DDS_STRAINS = 5000, so these are not upstream-dds sized.
+MAXNOOFBOARDS = 5000
+
+
+class dealPBN(ctypes.Structure):
+    _fields_ = [
+        ("trump", ctypes.c_int),
+        ("first", ctypes.c_int),
+        ("currentTrickSuit", ctypes.c_int * 3),
+        ("currentTrickRank", ctypes.c_int * 3),
+        ("remainCards", ctypes.c_char * 80),
+    ]
+
+
+class boardsPBN(ctypes.Structure):
+    _fields_ = [
+        ("noOfBoards", ctypes.c_int),
+        ("deals", dealPBN * MAXNOOFBOARDS),
+        ("target", ctypes.c_int * MAXNOOFBOARDS),
+        ("solutions", ctypes.c_int * MAXNOOFBOARDS),
+        ("mode", ctypes.c_int * MAXNOOFBOARDS),
+    ]
+
+
+class futureTricks(ctypes.Structure):
+    _fields_ = [
+        ("nodes", ctypes.c_int),
+        ("cards", ctypes.c_int),
+        ("suit", ctypes.c_int * 13),
+        ("rank", ctypes.c_int * 13),
+        ("equals", ctypes.c_int * 13),
+        ("score", ctypes.c_int * 13),
+    ]
+
+
+class solvedBoards(ctypes.Structure):
+    _fields_ = [
+        ("noOfBoards", ctypes.c_int),
+        ("solvedBoard", futureTricks * MAXNOOFBOARDS),
+    ]
+
+
 class DDSSResult:
     """Mimics endplay's DDTable interface so downstream code works unchanged.
 
@@ -169,6 +212,12 @@ def _load_dll() -> bool:
                 ctypes.c_int * 5,
                 ctypes.POINTER(ddTableResults),
                 ctypes.POINTER(parResults),
+            ]
+
+            loaded.SolveAllBoards.restype = ctypes.c_int
+            loaded.SolveAllBoards.argtypes = [
+                ctypes.POINTER(boardsPBN),
+                ctypes.POINTER(solvedBoards),
             ]
 
             loaded.SetMaxThreads.restype = None
@@ -319,6 +368,78 @@ def calc_all_tables_pbnx(
         raise RuntimeError(f"ddss CalcAllTablesPBNx error {ret}: {buf.value.decode()}")
 
     return [DDSSResult(results[i]) for i in range(n)]
+
+
+_STRAIN_INDEX = {"S": 0, "H": 1, "D": 2, "C": 3, "N": 4}
+_SEAT_INDEX = {"N": 0, "E": 1, "S": 2, "W": 3}
+_SUIT_CHARS = "SHDC"
+_RANK_CHARS = "--23456789TJQKA"  # DDS ranks are 2..14
+
+
+def solve_opening_leads(
+    positions: List[tuple],
+    chunk_size: int = MAXNOOFBOARDS,
+) -> List[dict]:
+    """Double-dummy tricks for every opening lead.
+
+    Parameters:
+        positions: (pbn, strain, leader) tuples. pbn is a full "N:..." deal,
+                   strain is one of SHDCN, leader is the seat on lead (NESW).
+        chunk_size: boards per SolveAllBoards call (at most MAXNOOFBOARDS).
+
+    Returns:
+        One dict per position, mapping each card the leader holds ("SA",
+        "HT", ...) to the tricks the defending side takes after that lead.
+
+    Raises:
+        RuntimeError: If ddss is not loaded or SolveAllBoards fails.
+        ValueError: On a bad strain, leader or chunk size.
+    """
+    if not DDSS_AVAILABLE:
+        raise RuntimeError("ddss DLL is not available")
+    if not 1 <= chunk_size <= MAXNOOFBOARDS:
+        raise ValueError(f"chunk_size must be 1..{MAXNOOFBOARDS}, got {chunk_size}")
+
+    out: List[dict] = []
+    bo = boardsPBN()
+    solved = solvedBoards()
+    for start in range(0, len(positions), chunk_size):
+        chunk = positions[start : start + chunk_size]
+        bo.noOfBoards = len(chunk)
+        for i, (pbn, strain, leader) in enumerate(chunk):
+            if strain not in _STRAIN_INDEX:
+                raise ValueError(f"bad strain {strain!r} for {pbn}")
+            if leader not in _SEAT_INDEX:
+                raise ValueError(f"bad leader {leader!r} for {pbn}")
+            d = bo.deals[i]
+            d.trump = _STRAIN_INDEX[strain]
+            d.first = _SEAT_INDEX[leader]
+            for j in range(3):
+                d.currentTrickSuit[j] = 0
+                d.currentTrickRank[j] = 0
+            d.remainCards = pbn.encode("ascii")
+            bo.target[i] = -1  # find the maximum
+            bo.solutions[i] = 3  # score every legal card
+            bo.mode[i] = 1
+        ret = _dll.SolveAllBoards(ctypes.byref(bo), ctypes.byref(solved))
+        if ret != 1:
+            buf = ctypes.create_string_buffer(80)
+            _dll.ErrorMessage(ret, buf)
+            raise RuntimeError(f"ddss SolveAllBoards error {ret}: {buf.value.decode()}")
+        for i in range(len(chunk)):
+            fut = solved.solvedBoard[i]
+            tricks: dict = {}
+            for c in range(fut.cards):
+                suit = _SUIT_CHARS[fut.suit[c]]
+                score = fut.score[c]
+                tricks[suit + _RANK_CHARS[fut.rank[c]]] = score
+                # Lower cards of the same suit that play the same.
+                equals = fut.equals[c]
+                for rank in range(2, 15):
+                    if equals & (1 << rank):
+                        tricks[suit + _RANK_CHARS[rank]] = score
+            out.append(tricks)
+    return out
 
 
 def get_par_results(

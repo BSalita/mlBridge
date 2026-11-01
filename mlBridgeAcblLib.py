@@ -1036,6 +1036,11 @@ def merge_clean_augment_club_dfs(dfs, sd_cache_d, acbl_number):  # todo: acbl_nu
         'tricks_taken': 'Tricks',
     })
 
+    # Opening lead, cleaned like acbl_board_results_augment_step1.py so
+    # FinalContractAugmenter scores it (DD_Lead_Cost). Absent when ACBL sent none.
+    if 'opening_lead' in df.columns:
+        df = df.rename({'opening_lead': 'Lead'}).with_columns(clean_opening_lead_expr('Lead'))
+
     df = df.with_columns([
         pl.col('Club').cast(pl.Int32), # todo: convert to Categorical but must align with acbl_club_model_data or convert in predict?
         pl.col('board_record_string').cast(pl.Utf8),
@@ -1197,6 +1202,21 @@ def merge_clean_augment_tournament_dfs(dfs, json_results_d, sd_cache_d, player_i
     df = acbldf_to_mldf(df) # todo: temporarily convert to pandas to use augment_df until clean_validate_df is converted to polars
 
     return df
+
+
+def clean_opening_lead_expr(col: str = 'Lead') -> pl.Expr:
+    """ACBL opening lead as suit then rank ("HK"); null when unreadable.
+
+    Accepts "10" for the ten and rank-first input ("KH"), as the batch
+    pipeline's CleanOpeningLead does.
+    """
+    lead = pl.col(col).cast(pl.Utf8).str.strip_chars().str.to_uppercase().str.replace('10', 'T', literal=True)
+    suit_first = (
+        pl.when(lead.str.contains(r'^[2-9TJQKA][SHDC]$'))
+        .then(lead.str.slice(1, 1) + lead.str.slice(0, 1))
+        .otherwise(lead)
+    )
+    return pl.when(suit_first.str.contains(r'^[SHDC][2-9TJQKA]$')).then(suit_first).otherwise(None).alias(col)
 
 
 def acbldf_to_mldf(df: pl.DataFrame) -> pl.DataFrame:

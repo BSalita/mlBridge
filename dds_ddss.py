@@ -265,6 +265,31 @@ def _ddss_dds_version() -> Optional[str]:
     return _dds_version_from_get_info(_dll, _DdssDDSInfo)
 
 
+_BSC_PREFIX = "bridge-solver-cpp dds-api"
+
+
+def _loaded_library() -> tuple[str, Optional[str]]:
+    """Which DDS-compatible library the loaded DLL is, and its revision.
+
+    bridge-solver-cpp's library (BSalita/bridge-solver, dds-api) has ddss's API
+    and version fields, so it is told apart by the first line of GetDDSInfo's
+    systemString: "bridge-solver-cpp dds-api <revision>". Anything else is ddss.
+    """
+    try:
+        get_info = _dll.GetDDSInfo
+        get_info.argtypes = [ctypes.POINTER(_DdssDDSInfo)]
+        get_info.restype = None
+        info = _DdssDDSInfo()
+        get_info(ctypes.byref(info))
+        first = info.systemString.decode("ascii", errors="replace").split("\n", 1)[0].strip()
+    except Exception:
+        return "ddss", None
+    if first.startswith(_BSC_PREFIX):
+        revision = first[len(_BSC_PREFIX):].strip() or None
+        return "bridge-solver-cpp", revision
+    return "ddss", None
+
+
 def _endplay_dds_version() -> Optional[str]:
     try:
         import endplay._dds as ep_dds
@@ -276,8 +301,12 @@ def _endplay_dds_version() -> Optional[str]:
 def engine_info() -> dict:
     """Return the live DD engine used by solve_dd_for_deals()."""
     if DDSS_AVAILABLE and _DLL_PATH is not None:
+        library, revision = _loaded_library()
         return {
+            # "ddss" for either library: both are loaded and called the same way.
             "engine": "ddss",
+            "library": library,  # "ddss" or "bridge-solver-cpp"
+            "revision": revision,
             "path": str(_DLL_PATH),
             "dds_version": _ddss_dds_version(),
         }
@@ -301,6 +330,8 @@ def engine_caption() -> str:
     info = engine_info()
     dds_version = info.get("dds_version") or "?"
     if info["engine"] == "ddss":
+        if info.get("library") == "bridge-solver-cpp":
+            return f"DDS: bridge-solver-cpp dds-api {info.get('revision') or '?'} (DDS {dds_version} API)"
         return f"DDS: ddss {dds_version}"
     endplay_version = info.get("endplay_version") or "?"
     return f"DDS: endplay dds {dds_version} (endplay {endplay_version})"

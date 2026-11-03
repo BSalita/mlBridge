@@ -624,7 +624,12 @@ class PostmortemBase(ABC):
                     )
             
             report_your_match_info = ". ".join(match_info_parts) if match_info_parts else ""
-            
+
+            # Optional (Chrome key, English default) set by the app, e.g. when
+            # the results' percentages are provisional or not published yet.
+            notice = st.session_state.get("report_notice")
+            report_notice = chrome_text(*notice) if notice else ""
+
             # Display report header
             st.markdown('<div style="height: 50px;"><a name="top-of-report"></a></div>', unsafe_allow_html=True)
             if streamlitlib is not None:
@@ -637,7 +642,9 @@ class PostmortemBase(ABC):
                 st.markdown(f"##### {report_game_results_webpage}")
             if report_your_match_info:
                 st.markdown(f"#### {report_your_match_info}")
-            
+            if report_notice:
+                st.warning(report_notice)
+
             # Initialize PDF assets
             pdf_assets = st.session_state.pdf_assets
             pdf_assets.clear()
@@ -649,6 +656,8 @@ class PostmortemBase(ABC):
                 pdf_assets.append(f"#### {report_game_results_webpage}")
             if report_your_match_info:
                 pdf_assets.append(f"### {report_your_match_info}")
+            if report_notice:
+                pdf_assets.append(f"#### {report_notice}")
             
             # Generate report sections from favorites
             try:

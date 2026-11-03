@@ -14,6 +14,7 @@ import ctypes
 import os
 import pathlib
 import sys
+import threading
 from typing import List, Optional
 
 import endplay._dds as endplay_dds
@@ -528,3 +529,164 @@ def get_par_results(
         }
         for i in range(n)
     ]
+
+
+# ---- Claims (CheckClaimPBN: bridge-solver-cpp's library and ddss, include/dll.h)
+
+
+class playTracePBN(ctypes.Structure):
+    _fields_ = [("number", ctypes.c_int), ("cards", ctypes.c_char * 106)]
+
+
+class claimResult(ctypes.Structure):
+    _fields_ = [
+        ("verdict", ctypes.c_int),
+        ("guaranteed", ctypes.c_int),
+        ("undecided", ctypes.c_int),
+        ("tricksWon", ctypes.c_int),
+        ("tricksLeft", ctypes.c_int),
+        ("nodes", ctypes.c_longlong),
+    ]
+
+
+CLAIM_DEFAULT_BUDGET = 2_000_000
+_CLAIM_VERDICTS = {0: "invalid", 1: "valid", 2: "undecided"}
+_CARD_CHARS = "23456789TJQKA"
+# ddss keeps search memory per thread index, so calls with one index must not
+# overlap; bridge-solver-cpp's library ignores the index.
+_claim_lock = threading.Lock()
+
+
+def claim_supported() -> bool:
+    """Whether the loaded library has the claim checker (CheckClaimPBN)."""
+    if not DDSS_AVAILABLE or _dll is None:
+        return False
+    try:
+        _dll.CheckClaimPBN
+    except AttributeError:
+        return False
+    return True
+
+
+def _normalize_card(card: str) -> str:
+    text = card.strip().upper().replace("10", "T")
+    if len(text) != 2 or text[0] not in _SUIT_CHARS or text[1] not in _CARD_CHARS:
+        raise ValueError(f"card {card!r} is not a suit then a rank, like SA or HT")
+    return text
+
+
+def check_claim(
+    pbn: str,
+    strain: str,
+    declarer: str,
+    plays: List[str],
+    claimer: Optional[str] = None,
+    total_tricks: Optional[int] = None,
+    leader: Optional[str] = None,
+    budget: int = CLAIM_DEFAULT_BUDGET,
+) -> dict:
+    """Whether a claim holds however the cards the claimer cannot see lie.
+
+    The claimer sees their own hand and dummy; the other two hands may be split
+    any way consistent with the play (hand sizes and show-outs) and are played
+    by an adversary. A defender's claim must work whatever partner holds and
+    however partner plays. This is the model BBO's claim checker is described
+    as using; the search is bridge-solver-rs's claim checker, ported.
+
+    Parameters:
+        pbn: the deal at the start of play, "N:..." (a full deal or an ending
+             with four equal hands).
+        strain: SHDC or N (NT).
+        declarer: NESW.
+        plays: cards played so far ("SA", "HT", ...), from the opening lead;
+               may end mid-trick.
+        claimer: the claiming seat; defaults to declarer. Dummy is declarer.
+        total_tricks: the claiming side's total for the hand, tricks already
+             won included (what BBO shows, LIN's mc). None asks for the
+             largest valid claim instead.
+        leader: who leads the first card; defaults to declarer's left.
+        budget: search nodes; a claim that runs out is "undecided", which
+             callers should treat as rejected, as BBO does.
+
+    Returns:
+        {"verdict": "valid" | "invalid" | "undecided"} for total_tricks, or
+        {"guaranteed": int, "undecided": bool} without it (totals for the
+        hand), plus tricks_won, tricks_left and nodes.
+
+    Raises:
+        RuntimeError: If the library is not loaded or has no claim checker.
+        ValueError: On bad input, with the library's error text.
+    """
+    if not claim_supported():
+        raise RuntimeError(
+            "the loaded DDS library has no claim checker (CheckClaimPBN); "
+            "it needs bridge-solver-cpp's dds-api or ddss with claims"
+        )
+    strain = strain.strip().upper()
+    if strain == "NT":
+        strain = "N"
+    if strain not in _STRAIN_INDEX:
+        raise ValueError(f"strain {strain!r} is not one of S, H, D, C, N")
+    seats = {}
+    for name, seat in (("declarer", declarer), ("claimer", claimer or declarer)):
+        seat = seat.strip().upper()
+        if seat not in _SEAT_INDEX:
+            raise ValueError(f"{name} {seat!r} is not one of N, E, S, W")
+        seats[name] = _SEAT_INDEX[seat]
+    if leader is None:
+        first = (seats["declarer"] + 1) % 4
+    else:
+        if leader.strip().upper() not in _SEAT_INDEX:
+            raise ValueError(f"leader {leader!r} is not one of N, E, S, W")
+        first = _SEAT_INDEX[leader.strip().upper()]
+    cards = [_normalize_card(card) for card in plays]
+    if len(cards) > 52:
+        raise ValueError("more than 52 cards played")
+    if total_tricks is not None and not 0 <= total_tricks <= 13:
+        raise ValueError(f"total_tricks {total_tricks} is not 0 .. 13")
+
+    deal = dealPBN()
+    deal.trump = _STRAIN_INDEX[strain]
+    deal.first = first
+    for j in range(3):
+        deal.currentTrickSuit[j] = 0
+        deal.currentTrickRank[j] = 0
+    deal.remainCards = pbn.strip().encode("ascii")
+    trace = playTracePBN()
+    trace.number = len(cards)
+    trace.cards = "".join(cards).encode("ascii")
+    result = claimResult()
+
+    fn = _dll.CheckClaimPBN
+    fn.restype = ctypes.c_int
+    fn.argtypes = [
+        dealPBN, playTracePBN, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        ctypes.c_longlong, ctypes.POINTER(claimResult), ctypes.c_int,
+    ]
+    with _claim_lock:
+        ret = fn(
+            deal, trace, seats["declarer"], seats["claimer"],
+            -1 if total_tricks is None else int(total_tricks),
+            int(budget), ctypes.byref(result), 0,
+        )
+    if ret != 1:
+        buf = ctypes.create_string_buffer(80)
+        _dll.ErrorMessage(ret, buf)
+        hint = {
+            -98: "a played card is not in the hand of the seat to play, or fails to follow suit",
+            -3: "the claim is for more tricks than remain",
+            -14: "the four hands are not the same size",
+            -99: "the deal is not PBN, N:<N> <E> <S> <W> with suits S.H.D.C",
+        }.get(ret)
+        detail = f"{hint} ({buf.value.decode()})" if hint else buf.value.decode()
+        raise ValueError(f"CheckClaimPBN error {ret}: {detail}")
+    out: dict = {}
+    if total_tricks is None:
+        out["guaranteed"] = result.guaranteed
+        out["undecided"] = bool(result.undecided)
+    else:
+        out["verdict"] = _CLAIM_VERDICTS[result.verdict]
+    out["tricks_won"] = result.tricksWon
+    out["tricks_left"] = result.tricksLeft
+    out["nodes"] = result.nodes
+    return out

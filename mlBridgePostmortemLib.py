@@ -168,6 +168,40 @@ def chrome_text(key: str, default: str) -> str:
     return default
 
 
+HAND_EXPECTATIONS_TABLE = "hand_expectations"
+# Session tables a favorite may read instead of "self".
+OWN_TABLES = (HAND_EXPECTATIONS_TABLE,)
+
+
+def query_reads_own_table(query: str) -> bool:
+    """True when the query names one of OWN_TABLES, so FROM "self" is not added to it."""
+    lowered = query.lower()
+    return any(f"from {table}" in lowered for table in OWN_TABLES)
+
+
+def attach_hand_expectations(con: Any, df: pl.DataFrame, session_id: Any) -> None:
+    """Build the session's hand_expectations table for the Hand Expectations button.
+
+    One row per board, direction and strain: how often that hand, as declarer,
+    takes each number of double dummy tricks when the other 39 cards are
+    shuffled into the three other hands. Shuffles per hand is
+    single_dummy_sample_count. The result is kept in the session until the
+    game or the sample count changes.
+    """
+    from mlBridge.mlBridgeAugmentLib import hand_trick_expectations_for_boards
+
+    shuffles = int(st.session_state.single_dummy_sample_count)
+    request = (str(session_id), shuffles)
+    if st.session_state.get("hand_expectations_request") != request:
+        with st.spinner(chrome_text("hand_expectations_spinner", "Calculating hand expectations...")):
+            st.session_state.hand_expectations_df = hand_trick_expectations_for_boards(
+                df, produce=shuffles, progress=st.progress(0)
+            )
+        st.session_state.hand_expectations_request = request
+    con.unregister(HAND_EXPECTATIONS_TABLE)
+    con.register(HAND_EXPECTATIONS_TABLE, st.session_state.hand_expectations_df)
+
+
 def standard_report_title() -> str:
     """Report heading. Organizer-only sessions are marked provisional."""
     title = chrome_text("report_title", "Bridge Game Postmortem Report")
@@ -268,7 +302,7 @@ class PostmortemBase(ABC):
         if 'from "self"' not in query.lower():
             query = query.replace('FROM self', 'FROM "self"')
             query = query.replace('from self', 'FROM "self"')
-        if 'from "self"' not in query.lower():
+        if 'from "self"' not in query.lower() and not query_reads_own_table(query):
             query = 'FROM "self" ' + query
 
         try:

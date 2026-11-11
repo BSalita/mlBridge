@@ -1989,6 +1989,114 @@ def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.Da
     return sd_dfs_d, combined_sd_probs_df
 
 
+HAND_EXPECTATION_SOLVE_BATCH_DEALS = 1000
+
+
+def estimate_hand_trick_expectations(pbns: list[str], produce: int = 10, seed: int = 42, progress: Optional[Any] = None) -> pl.DataFrame:
+    """Trick-taking probabilities of each hand of each deal, before any bidding.
+
+    Purpose:
+    - For every deal and every direction, keep that direction's 13 cards and
+      shuffle the other 39 into the three other hands `produce` times.
+    - Double-dummy solve every shuffle and count how often that direction, as
+      declarer, takes each number of tricks in each strain.
+    - estimate_sd_trick_distributions_for_df keeps both hands of a partnership;
+      this keeps one hand.
+
+    Parameters:
+    - pbns: full-deal PBN strings, North first. A repeated PBN is solved once.
+    - produce: number of shuffles per deal and direction.
+    - seed: random seed; every deal and direction starts from it.
+    - progress: optional progress sink (streamlit progress bar or tqdm).
+
+    Input columns:
+    - None (operates on PBN strings, not DataFrame columns).
+
+    Output columns:
+    - `PBN`: the deal (pl.String)
+    - `Direction`: N, E, S or W: the hand kept, which is also the declarer (pl.String)
+    - `Strain`: S, H, D, C or N (pl.String)
+    - `Prob_Taking_0` .. `Prob_Taking_13`: shuffles where DD tricks equal n, divided by `Shuffles` (pl.Float32)
+    - `Shuffles`: number of shuffles (pl.UInt32)
+
+    Returns:
+    - One row per PBN, Direction and Strain, in the order of `pbns`, then NESW, then SHDCN.
+    """
+    assert produce >= 1, produce
+    directions = 'NESW'
+    strains = 'SHDCN'  # order of the DD table's to_list()
+    schema = {'PBN': pl.String, 'Direction': pl.String, 'Strain': pl.String}
+    schema.update({f'Prob_Taking_{n}': pl.Float32 for n in range(14)})
+    schema['Shuffles'] = pl.UInt32
+
+    def report(done: int, total: int) -> None:
+        percent = 100 if total == 0 else int(done * 100 / total)
+        msg = f"{percent}%: Hand expectations calculated for {done} of {total} unique deals using {produce} shuffles per hand."
+        if progress is None:
+            logger.info(msg)
+        elif hasattr(progress, 'progress'):  # streamlit
+            progress.progress(percent, msg)
+        elif hasattr(progress, 'set_description'):  # tqdm
+            progress.set_description(msg)
+
+    unique_pbns = list(dict.fromkeys(pbns))
+    total = len(unique_pbns)
+    pbns_per_batch = max(1, HAND_EXPECTATION_SOLVE_BATCH_DEALS // (len(directions) * produce))
+    rows = []
+    for batch_start in range(0, total, pbns_per_batch):
+        report(batch_start, total)
+        batch_pbns = unique_pbns[batch_start:batch_start + pbns_per_batch]
+        deals = []
+        for pbn in batch_pbns:
+            assert pbn.startswith('N:'), pbn
+            hands = pbn[2:].split()
+            assert len(hands) == 4, pbn
+            for kept in range(4):
+                predeal = ['...'] * 4
+                predeal[kept] = hands[kept]
+                deals.extend(generate_unconstrained_deal_pbns(Deal('N:' + ' '.join(predeal)), produce, seed=seed))
+        tables = solve_dd_for_pbns(deals)
+        # tricks[deal, kept hand, shuffle, strain, declarer]
+        tricks = np.array([table.to_list() for table in tables], dtype=np.int64).reshape(
+            len(batch_pbns), len(directions), produce, len(strains), len(directions)
+        )
+        for p, pbn in enumerate(batch_pbns):
+            for d, direction in enumerate(directions):
+                for s, strain in enumerate(strains):
+                    counts = np.bincount(tricks[p, d, :, s, d], minlength=14)
+                    rows.append([pbn, direction, strain, *(counts / produce).tolist(), produce])
+    report(total, total)
+    if progress is not None and hasattr(progress, 'empty'):
+        progress.empty()
+    return pl.DataFrame(rows, schema=schema, orient='row')
+
+
+def hand_trick_expectations_for_boards(df: pl.DataFrame, produce: int = 10, seed: int = 42, progress: Optional[Any] = None) -> pl.DataFrame:
+    """estimate_hand_trick_expectations for every board of a session.
+
+    Parameters:
+    - df: session DataFrame; any number of rows per board.
+    - produce, seed, progress: as for estimate_hand_trick_expectations.
+
+    Input columns:
+    - `Board`: board number
+    - `PBN`: the board's deal
+
+    Output columns:
+    - `Board`, then `Direction`, `Strain`, `Prob_Taking_0` .. `Prob_Taking_13`,
+      `Shuffles` and `PBN` as in estimate_hand_trick_expectations.
+
+    Returns:
+    - One row per Board, Direction and Strain, sorted by Board, then NESW, then SHDCN.
+    """
+    boards_df = df.select('Board', 'PBN').drop_nulls().unique().sort('Board', 'PBN')
+    probs_df = estimate_hand_trick_expectations(boards_df['PBN'].to_list(), produce=produce, seed=seed, progress=progress)
+    return (
+        probs_df.with_row_index('_order')
+        .join(boards_df, on='PBN', how='inner')
+        .sort('Board', '_order')
+        .select('Board', pl.exclude('Board', 'PBN', '_order'), 'PBN')
+    )
 
 
 

@@ -179,19 +179,21 @@ def query_reads_own_table(query: str) -> bool:
     return any(f"from {table}" in lowered for table in OWN_TABLES)
 
 
-def attach_hand_expectations(con: Any, df: pl.DataFrame, session_id: Any) -> None:
+def attach_hand_expectations(con: Any, df: pl.DataFrame) -> None:
     """Build the session's hand_expectations table for the Hand Expectations button.
 
     One row per board, direction and strain: how often that hand, as declarer,
     takes each number of double dummy tricks when the other 39 cards are
     shuffled into the three other hands. Shuffles per hand is
     single_dummy_sample_count. The result is kept in the session until the
-    game or the sample count changes.
+    deals or the sample count change; the deals are the key because a PBN
+    game has no session id.
     """
     from mlBridge.mlBridgeAugmentLib import hand_trick_expectations_for_boards
 
     shuffles = int(st.session_state.single_dummy_sample_count)
-    request = (str(session_id), shuffles)
+    deals = df.select("Board", "PBN").drop_nulls().unique().sort("Board", "PBN")
+    request = (tuple(deals.iter_rows()), shuffles)
     if st.session_state.get("hand_expectations_request") != request:
         with st.spinner(chrome_text("hand_expectations_spinner", "Calculating hand expectations...")):
             st.session_state.hand_expectations_df = hand_trick_expectations_for_boards(
@@ -200,6 +202,27 @@ def attach_hand_expectations(con: Any, df: pl.DataFrame, session_id: Any) -> Non
         st.session_state.hand_expectations_request = request
     con.unregister(HAND_EXPECTATIONS_TABLE)
     con.register(HAND_EXPECTATIONS_TABLE, st.session_state.hand_expectations_df)
+
+
+def sidebar_report_buttons(con: Any, button_ids: tuple[str, ...]) -> None:
+    """Sidebar buttons that choose which report write_standard_report shows.
+
+    button_ids are keys of favorites['Buttons'], shown in that order. The
+    clicked key becomes button_title; Hand_Expectations also builds its table.
+    For apps whose sidebar has no report buttons of its own (BridgeWebs, PBN).
+    """
+    st.sidebar.markdown("---")
+    st.sidebar.write(chrome_text("favorite_prompts", "Favorites"))
+    buttons = st.session_state.favorites["Buttons"]
+    for key in button_ids:
+        button = buttons[key]
+        label = localized_field(button, "title", key)
+        help_text = localized_field(button, "help")
+        if st.sidebar.button(label, help=help_text or None, key=key):
+            st.session_state.sql_query_mode = False
+            st.session_state.button_title = key
+            if key == "Hand_Expectations":
+                attach_hand_expectations(con, st.session_state.df)
 
 
 def standard_report_title() -> str:

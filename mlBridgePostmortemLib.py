@@ -14,6 +14,7 @@ from streamlit_extras.bottom_container import bottom
 from stqdm import stqdm
 import pathlib
 import subprocess
+import time
 import duckdb
 import json
 import platform
@@ -173,6 +174,33 @@ HAND_EXPECTATIONS_TABLE = "hand_expectations"
 OWN_TABLES = (HAND_EXPECTATIONS_TABLE,)
 
 
+# Streamlit starts a rerun at once, while the run it replaces can still be
+# inside a query on the session's connection (server.fastReruns). DuckDB 2
+# refuses a second call on a busy connection instead of waiting for it, so a
+# sidebar change or a button click in the middle of a report raised
+# ResourceInUseException. The replaced run stops at its next Streamlit call,
+# which follows every query, so the wait is one query long.
+CONNECTION_BUSY_TIMEOUT_S = 30.0
+_CONNECTION_BUSY_PAUSE_S = 0.02
+
+
+def when_connection_free(call, timeout_s: float = CONNECTION_BUSY_TIMEOUT_S):
+    """Return call(), trying again while DuckDB reports the connection busy.
+
+    Wrap every call on a session connection: con.sql(...).pl(), con.execute,
+    con.register, con.unregister. call must be safe to repeat; DuckDB refuses
+    a busy connection before doing any of the work.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            return call()
+        except duckdb.ResourceInUseException:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(_CONNECTION_BUSY_PAUSE_S)
+
+
 def query_reads_own_table(query: str) -> bool:
     """True when the query names one of OWN_TABLES, so FROM "self" is not added to it."""
     lowered = query.lower()
@@ -200,8 +228,10 @@ def attach_hand_expectations(con: Any, df: pl.DataFrame) -> None:
                 df, produce=shuffles, progress=st.progress(0)
             )
         st.session_state.hand_expectations_request = request
-    con.unregister(HAND_EXPECTATIONS_TABLE)
-    con.register(HAND_EXPECTATIONS_TABLE, st.session_state.hand_expectations_df)
+    when_connection_free(lambda: con.unregister(HAND_EXPECTATIONS_TABLE))
+    when_connection_free(
+        lambda: con.register(HAND_EXPECTATIONS_TABLE, st.session_state.hand_expectations_df)
+    )
 
 
 def sidebar_report_buttons(con: Any, button_ids: tuple[str, ...]) -> None:
@@ -332,12 +362,14 @@ class PostmortemBase(ABC):
             con = self.get_session_duckdb_connection()
             # Validate the single source of truth is registered by the app
             try:
-                con.execute('DESCRIBE "self"').fetchall()
+                when_connection_free(lambda: con.execute('DESCRIBE "self"').fetchall())
             except Exception:
                 st.info("Data is loading... Please wait for processing to complete.")
                 return None
 
-            result_df = cast_numeric_display_columns(con.sql(query).pl())
+            result_df = cast_numeric_display_columns(
+                when_connection_free(lambda: con.sql(query).pl())
+            )
             st.text(f"Result is a dataframe of {len(result_df)} rows.")
             
             # Import streamlitlib for display

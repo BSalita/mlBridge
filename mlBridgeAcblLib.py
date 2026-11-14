@@ -1479,7 +1479,7 @@ ACBL_BROWSER_LAUNCH_ARGS = [
 # Patch the JS environment before any page script runs, hiding the most common
 # headless-Chromium tells that bot-detection scripts (e.g. Cloudflare) probe for.
 ACBL_STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false });
 window.chrome = window.chrome || { runtime: {} };
 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
 if (navigator.plugins.length === 0) {
@@ -1505,6 +1505,20 @@ ACBL_DEFAULT_PROFILE_DIRS = (
     pathlib.Path('e:/bridge/data/acbl/playwright_profile'),  # shared with acbl_club_download_to_json.py
     pathlib.Path('playwright_profile'),
 )
+def acbl_sync_playwright():
+    """
+    Return sync_playwright from patchright when installed, else from Playwright.
+
+    Patchright is a drop-in Playwright fork that does not send CDP
+    Runtime.enable, the automation tell Cloudflare detects on my.acbl.org.
+    """
+    try:
+        from patchright.sync_api import sync_playwright
+    except ImportError:
+        from playwright.sync_api import sync_playwright
+    return sync_playwright
+
+
 def resolve_acbl_browser_profile_dir():
     """
     Return the persistent Chrome profile directory to use, or None if none is
@@ -1676,8 +1690,8 @@ def _get_club_results_sync(acbl_number, headless=True, save_screenshot=None, lim
     Internal sync version that runs Playwright. 
     Use get_club_results_from_acbl_number_playwright() instead.
     """
-    from playwright.sync_api import sync_playwright
-    
+    sync_playwright = acbl_sync_playwright()
+
     url = f"https://my.acbl.org/club-results/my-results/{acbl_number}"
     if verbose:
         print(f"Fetching with Playwright: {url}")
@@ -1914,8 +1928,8 @@ def _get_club_results_details_sync(url, headless=True, verbose=True):
     Internal sync version that runs Playwright.
     Use get_club_results_details_data_playwright() instead.
     """
-    from playwright.sync_api import sync_playwright
-    
+    sync_playwright = acbl_sync_playwright()
+
     if verbose:
         print(f"  Fetching details with Playwright: {url}")
     

@@ -1688,7 +1688,7 @@ def generate_single_dummy_deals(predeal_string: str, produce: int, env: Dict[str
     return deals, solve_dd_for_deals(deals)
 
 
-def estimate_sd_trick_distributions(deal: str, produce: int = 100) -> Tuple[Dict[str, pl.DataFrame], Tuple[int, Dict[Tuple[str, str, str], list[float]]]]:
+def estimate_sd_trick_distributions(deal: str, produce: int = 100, seed: int = 42) -> Tuple[Dict[str, pl.DataFrame], Tuple[int, Dict[Tuple[str, str, str], list[float]]]]:
     """Estimate single-dummy trick distributions by side (NS/EW) for a given deal string.
 
     Purpose:
@@ -1700,6 +1700,9 @@ def estimate_sd_trick_distributions(deal: str, produce: int = 100) -> Tuple[Dict
     Parameters:
     - deal: PBN string for a full deal.
     - produce: number of generated deals per side.
+    - seed: random seed for the generated deals; NS and EW each start from it.
+      The same seed gives the same deals, so to add trials to an earlier run,
+      pass a different seed or the new trials repeat the old ones.
 
     Input columns:
     - None (operates on PBN deal string, not DataFrame columns).
@@ -1728,7 +1731,7 @@ def estimate_sd_trick_distributions(deal: str, produce: int = 100) -> Tuple[Dict
         predeal_string = 'N:'+' '.join(s)
         #logger.info(f"predeal:{predeal_string}")
 
-        sd_deals, sd_dd_result_tables = generate_single_dummy_deals(predeal_string, produce, show_progress=False)
+        sd_deals, sd_dd_result_tables = generate_single_dummy_deals(predeal_string, produce, seed=seed, show_progress=False)
 
         #show_dd_deals(sd_deals, sd_dd_result_tables, 0, 4)
         # Create DataFrame more efficiently - collect all data at once
@@ -1796,7 +1799,7 @@ def _build_sd_probs_df(sd_d: Dict[str, Any]) -> pl.DataFrame:
     return sd_probs_df.with_columns(pl.col(pl.Float64).cast(pl.Float32))
 
 
-def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.DataFrame, sd_productions: int = 100, max_sd_adds=100, progress: Optional[Any] = None, cache_file_path: Optional[pathlib.Path] = None, persist_every: int = SD_CACHE_PERSIST_EVERY) -> Tuple[Dict[str, pl.DataFrame], pl.DataFrame]:
+def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.DataFrame, sd_productions: int = 100, max_sd_adds=100, progress: Optional[Any] = None, cache_file_path: Optional[pathlib.Path] = None, persist_every: int = SD_CACHE_PERSIST_EVERY, seed: int = 42) -> Tuple[Dict[str, pl.DataFrame], pl.DataFrame]:
     """Compute and cache single-dummy probabilities for PBNs needing them.
 
     Purpose:
@@ -1813,6 +1816,7 @@ def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.Da
     - progress: optional progress sink.
     - cache_file_path: optional parquet path; if provided, persist cache updates during long SD runs.
     - persist_every: number of PBNs to process between cache persists.
+    - seed: random seed for the generated deals, as for estimate_sd_trick_distributions.
 
     Input columns:
     - `PBN`: Bridge deal notation string for analysis
@@ -1903,7 +1907,7 @@ def estimate_sd_trick_distributions_for_df(df: pl.DataFrame, hrs_cache_df: pl.Da
                     s[0] = '...'
                     s[2] = '...'
                 predeal_string = 'N:' + ' '.join(s)
-                deals = generate_unconstrained_deal_pbns(Deal(predeal_string), sd_productions, seed=42)
+                deals = generate_unconstrained_deal_pbns(Deal(predeal_string), sd_productions, seed=seed)
                 start_idx = len(all_deals)
                 all_deals.extend(deals)
                 deal_groups.append((pbn, ns_ew, start_idx, len(deals), deals))

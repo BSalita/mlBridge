@@ -1072,6 +1072,7 @@ def compute_scaling_parameters(df: pl.DataFrame, apply_scaling: bool = True, ver
         return scaling_params
 
     numeric_cols = list(df.columns)
+    nan_cols: List[Tuple[str, int]] = []
     if verbose:
         print(f"🔢 Computing scaling parameters for {len(numeric_cols)} numeric features...")
 
@@ -1094,6 +1095,18 @@ def compute_scaling_parameters(df: pl.DataFrame, apply_scaling: bool = True, ver
                 # Float/Int and other numeric-like types: direct conversion
                 numeric_series = series.cast(pl.Float64)
 
+            # NaN counts as missing, like null. Polars mean()/std() return NaN
+            # when any value is NaN, and the fallback below would then leave
+            # the whole column unscaled (mean 0, std 1). Found 2026-11-15:
+            # 0.07-0.25% NaN pair ratings left Elo_R_{NS,EW}_EventStart at
+            # ~1500 in six ACBL models. The matrix builders turn NaN and null
+            # into 0 before scaling, so both are the same value to the model.
+            if numeric_series.dtype.is_float():
+                nan_count = int(numeric_series.is_nan().sum())
+                if nan_count:
+                    nan_cols.append((col, nan_count))
+                    numeric_series = numeric_series.fill_nan(None)
+
             mean_val = numeric_series.mean()
             std_val = numeric_series.std()
             mean = 0.0 if (mean_val is None or not np.isfinite(mean_val)) else float(mean_val)
@@ -1105,6 +1118,10 @@ def compute_scaling_parameters(df: pl.DataFrame, apply_scaling: bool = True, ver
                 print(f"⚠️ Failed to compute scaling for {col}: {e}")
             continue
 
+    if nan_cols:
+        shown = ", ".join(f"{c} ({n:,})" for c, n in nan_cols[:20])
+        more = f" and {len(nan_cols) - 20} more" if len(nan_cols) > 20 else ""
+        print(f"⚠️ NaN values treated as missing when scaling {len(nan_cols)} feature(s): {shown}{more}")
     if verbose:
         print(f"✅ Computed scaling parameters for {len(scaling_params)} features")
 
@@ -2892,11 +2909,18 @@ def create_torch_shards(
     schema: Dict[str, Any],
     shard_rows_count: int = 500_000,
     apply_scaling: bool = True,
+    row_order: Optional[np.ndarray] = None,
 ) -> List[pathlib.Path]:
     """
     Purpose:
         Full-service writer: create tensor shards for PyTorch training using a provided schema dict
         and save them to disk under '{model_name}_shard_{i:09d}.pt' in schema['saved_models_path'].
+
+        row_order (optional): one df row index per output row. Shard i then holds
+        df rows row_order[i*shard_rows_count : (i+1)*shard_rows_count] in that
+        order, instead of a slice in file order. Use it to mix the training rows
+        when df is sorted (see shuffled_train_row_order). Each shard costs one
+        gather of shard_rows_count rows; df itself is never copied.
 
     Args:
         df: Source Polars DataFrame with features and target.
@@ -2926,11 +2950,19 @@ def create_torch_shards(
             except Exception:
                 pass
 
+    if row_order is not None and len(row_order) != df.height:
+        raise ValueError(f"row_order has {len(row_order):,} entries, df has {df.height:,} rows")
+
     written: List[pathlib.Path] = []
     shard_index = 0
     for start in tqdm(range(0, df.height, shard_rows_count), desc="creating shards"):
         end = min(start + shard_rows_count, df.height)
-        tensors = _shard_tensors(df.slice(start, end - start), schema, apply_scaling)
+        if row_order is None:
+            shard_df = df.slice(start, end - start)
+        else:
+            shard_df = df[pl.Series(row_order[start:end], dtype=pl.UInt32)]
+        tensors = _shard_tensors(shard_df, schema, apply_scaling)
+        del shard_df
 
         shard_path = resolve_shards_path(saved_models_path, model_name, shard_index)
         torch.save(tensors, shard_path)
@@ -2943,6 +2975,29 @@ def create_torch_shards(
         gc.collect()
 
     return written
+
+
+def shuffled_train_row_order(num_rows: int, shard_rows_count: int, n_valid_shards: int = 1, seed: int = 42) -> np.ndarray:
+    """
+    Row order for create_torch_shards that mixes the training rows and leaves
+    the validation rows where they are.
+
+    The shard trainers hold out the last n_valid_shards shards for validation
+    and read the other shards in file order, batch after batch, every epoch.
+    When df is sorted by date with one session's rows together (ACBL step 5b
+    since 2026-10-24, so that validation is the newest data), a batch is a
+    handful of sessions and an epoch walks through the years in order. This
+    returns a seeded permutation of the rows of the training shards followed
+    by the validation rows in their original order.
+    """
+    if shard_rows_count <= 0 or num_rows <= 0:
+        return np.arange(max(0, num_rows), dtype=np.uint32)
+    num_shards = -(-num_rows // shard_rows_count)
+    n_train_rows = max(0, num_shards - n_valid_shards) * shard_rows_count
+    n_train_rows = min(n_train_rows, num_rows)
+    order = np.arange(num_rows, dtype=np.uint32)
+    np.random.default_rng(seed).shuffle(order[:n_train_rows])
+    return order
 
 
 def build_torch_shards(

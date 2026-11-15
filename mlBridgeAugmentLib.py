@@ -5540,10 +5540,33 @@ def compute_event_start_end_elo_columns(df_sorted: pl.DataFrame) -> pl.DataFrame
                 pl.col(before_col).first().over(["session_id", pid_col]).alias(out_col)
             )
 
+    # Pair start and end are taken per pair, and a pair is its two player ids:
+    # the key the pair Elo itself rates (_pair_elo_frame). Pair_Number repeats
+    # in every section of a session, so grouping by it gave every pair with
+    # that number the rating of whichever of them came first (start) or last
+    # (end) in the frame. Found 2026-11-15: 31% of ACBL tournament rows had
+    # another pair's session-start rating, and it was NaN where that other
+    # pair had an unknown player. Pair_Number stays the fallback when the
+    # player ids are absent, as in _pair_elo_frame. Rows without a pair key
+    # (an unknown player) form one group per session and keep the unrated
+    # value those rows already have.
+    has_player_ids = all(
+        c in df_sorted.columns
+        for c in ("Player_ID_N", "Player_ID_S", "Player_ID_E", "Player_ID_W")
+    )
+    if has_player_ids:
+        df_sorted = df_sorted.with_columns(
+            _Elo_Pair_Key_NS=pair_key_expr("Player_ID_N", "Player_ID_S"),
+            _Elo_Pair_Key_EW=pair_key_expr("Player_ID_E", "Player_ID_W"),
+        )
+        pair_group_ns, pair_group_ew = "_Elo_Pair_Key_NS", "_Elo_Pair_Key_EW"
+    else:
+        pair_group_ns, pair_group_ew = "Pair_Number_NS", "Pair_Number_EW"
+
     # Pair start
     pair_before_cols = {
-        "NS": ("Pair_Number_NS", "Elo_R_NS_Before", "Elo_R_NS_EventStart"),
-        "EW": ("Pair_Number_EW", "Elo_R_EW_Before", "Elo_R_EW_EventStart"),
+        "NS": (pair_group_ns, "Elo_R_NS_Before", "Elo_R_NS_EventStart"),
+        "EW": (pair_group_ew, "Elo_R_EW_Before", "Elo_R_EW_EventStart"),
     }
     for _, (pair_col, before_col, out_col) in pair_before_cols.items():
         if pair_col in df_sorted.columns and before_col in df_sorted.columns:
@@ -5566,14 +5589,17 @@ def compute_event_start_end_elo_columns(df_sorted: pl.DataFrame) -> pl.DataFrame
 
     # Pair end
     pair_after_cols = {
-        "NS": ("Pair_Number_NS", "Elo_R_NS", "Elo_R_NS_EventEnd"),
-        "EW": ("Pair_Number_EW", "Elo_R_EW", "Elo_R_EW_EventEnd"),
+        "NS": (pair_group_ns, "Elo_R_NS", "Elo_R_NS_EventEnd"),
+        "EW": (pair_group_ew, "Elo_R_EW", "Elo_R_EW_EventEnd"),
     }
     for _, (pair_col, after_col, out_col) in pair_after_cols.items():
         if pair_col in df_sorted.columns and after_col in df_sorted.columns:
             df_sorted = df_sorted.with_columns(
                 pl.col(after_col).last().over(["session_id", pair_col]).alias(out_col)
             )
+
+    if has_player_ids:
+        df_sorted = df_sorted.drop("_Elo_Pair_Key_NS", "_Elo_Pair_Key_EW")
 
     logger.info(f"Event start/end Elo columns: {time.time()-t:.3f} seconds")
     return df_sorted

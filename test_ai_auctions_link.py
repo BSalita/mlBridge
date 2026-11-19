@@ -63,6 +63,25 @@ def test_url_holds_each_deal_once_and_nothing_personal():
     assert [(b[0], b[1], b[2]) for b in unpack(asked["boards"][0])] == [(1, "N", "None"), (2, "E", "NS")]
 
 
+def test_played_contract_of_the_players_table_only():
+    third = "S:T7.AJ5.KQ962.AQ4 43.T82.J74.JT765 AQJ9652.64.T3.82 K8.KQ973.A85.K93"
+    df = pl.DataFrame({
+        "Board": [1, 1, 2, 2, 3, 3, 4],
+        "PBN": [NORTH_FIRST, NORTH_FIRST, EAST_FIRST, EAST_FIRST, third, third, NORTH_FIRST],
+        "Dealer": ["N", "N", "E", "E", "S", "S", "W"], "Vul": ["None", "None", "N_S", "N_S", "E_W", "E_W", "Both"],
+        "Contract": ["4SXE", "3NN", "PASS", "2HS", "3NN", "3NS", "A+"],
+        "Tricks": [9, 10, None, 8, 9, 9, None],
+        # board 1: the player's table; 2: passed out there; 3: not played by the player; 4: an adjusted score
+        "Boards_I_Played": [True, False, True, False, False, False, True],
+    })
+    asked = parse_qs(urlsplit(ai_auctions_url(df, "ffbridge", "E")).query, keep_blank_values=True)
+    assert asked["played"] == ["4SXE-9.PASS.."]
+    assert len(unpack(asked["boards"][0])) == 4
+
+    two_tables = df.with_columns(pl.lit(True).alias("Boards_I_Played")).filter(pl.col("Board") == 1)
+    assert "played" not in parse_qs(urlsplit(ai_auctions_url(two_tables, "pbn")).query)
+
+
 def test_no_deals_is_an_error():
     df = pl.DataFrame({"Board": [1], "PBN": [None], "Dealer": ["N"], "Vul": ["None"]}, schema_overrides={"PBN": pl.String})
     with pytest.raises(ValueError, match="no deals"):

@@ -312,12 +312,46 @@ def pack_boards(boards: List[tuple]) -> str:
     return "1" + base64.urlsafe_b64encode(bytes(packed)).decode().rstrip("=")
 
 
+def played_contracts(df: pl.DataFrame, deals: pl.DataFrame) -> List[str]:
+    """What the report's player played on each deal of deals, for the explorer's ?played=.
+
+    One text a deal, in the order of deals: the contract with its declarer and
+    the tricks taken ('4SXE-9'), 'PASS' for a board passed out, '' when the
+    player's rows (Boards_I_Played) do not give one table for the deal: a board
+    the player sat out, a game opened without a player, or a contract that is
+    not a bid (an adjusted score). Empty list when df lacks those columns.
+    """
+    import re
+
+    if not {"Boards_I_Played", "Contract", "Tricks"} <= set(df.columns):
+        return []
+    tables: Dict[tuple, set] = {}
+    mine = df.filter(pl.col("Boards_I_Played")).select("Board", "PBN", "Contract", "Tricks").unique()
+    for board, pbn, contract, tricks in mine.iter_rows():
+        tables.setdefault((board, pbn), set()).add((contract, tricks))
+    played = []
+    for board, pbn, *_ in deals.iter_rows():
+        text = ""
+        found = tables.get((board, pbn), set())
+        if len(found) == 1:
+            contract, tricks = next(iter(found))
+            contract = str(contract or "").strip().upper()
+            if contract == "PASS":
+                text = "PASS"
+            elif re.fullmatch(r"[1-7][CDHSN]X{0,2}[NESW]", contract):
+                text = contract if tricks is None else f"{contract}-{int(tricks)}"
+        played.append(text)
+    return played
+
+
 def ai_auctions_url(df: pl.DataFrame, source: str, seat: Optional[str] = None) -> str:
     """Address of the auction model explorer opened on the boards of df.
 
     source names this app to the explorer: acbl, ffbridge, bridgewebs, pbn or
-    brill. seat (N, E, S or W) is the seat the explorer looks from first. Only
-    the deals go into the address: no names and no results.
+    brill. seat (N, E, S or W) is the seat the explorer looks from first. The
+    address holds the deals and, where the report is about one player, the
+    contract and tricks at that player's table on each board (played=). No
+    names and no scores.
     """
     from urllib.parse import urlencode
 
@@ -334,6 +368,9 @@ def ai_auctions_url(df: pl.DataFrame, source: str, seat: Optional[str] = None) -
     asked = {"from": source, "boards": pack_boards(list(deals.iter_rows()))}
     if seat in tuple(_PACK_SEATS):
         asked["seat"] = seat
+    played = played_contracts(df, deals)
+    if any(played):
+        asked["played"] = ".".join(played)
     return f"{AI_AUCTIONS_URL}/?{urlencode(asked)}"
 
 
@@ -358,7 +395,7 @@ def sidebar_ai_auctions_link(source: str) -> None:
         help=chrome_text(
             "ai_auctions_help",
             "Open this game's boards in the auction explorer: robots bid each board, and the page shows what "
-            "the AI believes after every call. Opens in a new tab.",
+            "the AI believes after every call, next to the contract you played. Opens in a new tab.",
         ),
     )
 

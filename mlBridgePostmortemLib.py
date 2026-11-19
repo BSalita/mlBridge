@@ -255,6 +255,114 @@ def sidebar_report_buttons(con: Any, button_ids: tuple[str, ...]) -> None:
                 attach_hand_expectations(con, st.session_state.df)
 
 
+# The auction model explorer (src/auction-model, streamlit_app_auction_explorer.py), which reads the boards of a
+# game from its address.
+AI_AUCTIONS_URL = os.environ.get("AI_AUCTIONS_URL", "https://auction.7nt.info")
+AI_AUCTIONS_MAX_BOARDS = 400  # 22 characters a board; keeps the address under 9,000 characters
+_PACK_SEATS = "NESW"
+_PACK_RANKS = "AKQJT98765432"
+_PACK_VULS = {
+    "NONE": 0, "O": 0, "-": 0, "LOVE": 0,
+    "NS": 1, "N_S": 1, "N-S": 1, "N/S": 1,
+    "EW": 2, "E_W": 2, "E-W": 2, "E/W": 2,
+    "BOTH": 3, "ALL": 3, "B": 3,
+}
+
+
+def pack_boards(boards: List[tuple]) -> str:
+    """Boards as one short text for the explorer's ?boards= (its game_boards reads it back).
+
+    boards: (board number, PBN deal 'N:<N> <E> <S> <W>' from any first seat,
+    dealer, vulnerability) each. After the version digit, base64 of 16 bytes a
+    board: board number (2), dealer and vulnerability (1), then the holder of
+    each of the 52 cards, spades to clubs and ace to two, 2 bits a card (13).
+    """
+    import base64
+
+    packed = bytearray()
+    for number, pbn, dealer, vul in boards:
+        text = str(pbn).strip()
+        if len(text) < 2 or text[1] != ":" or text[0].upper() not in _PACK_SEATS:
+            raise ValueError(f"board {number}: deal {text!r} does not start with a seat and a colon")
+        hands = text[2:].split()
+        if len(hands) != 4:
+            raise ValueError(f"board {number}: {len(hands)} hands in the deal")
+        first = _PACK_SEATS.index(text[0].upper())
+        holder: Dict[int, int] = {}
+        for offset, hand in enumerate(hands):
+            suits = hand.split(".")
+            if len(suits) != 4:
+                raise ValueError(f"board {number}: hand {hand!r} does not have four suits")
+            for suit, cards in enumerate(suits):
+                for rank in cards.upper().replace("10", "T"):
+                    holder[suit * 13 + _PACK_RANKS.index(rank)] = (first + offset) % 4
+        if len(holder) != 52:
+            raise ValueError(f"board {number}: {len(holder)} different cards in the deal")
+        holders = 0
+        for card in range(52):
+            holders = holders << 2 | holder[card]
+        vul_code = _PACK_VULS.get(str(vul).strip().upper())
+        if vul_code is None:
+            raise ValueError(f"board {number}: vulnerability {vul!r} is not known")
+        if not 0 <= int(number) < 65536:
+            raise ValueError(f"board number {number} does not fit")
+        packed += int(number).to_bytes(2, "big")
+        packed.append(_PACK_SEATS.index(str(dealer).strip().upper()) | vul_code << 2)
+        packed += holders.to_bytes(13, "big")
+    return "1" + base64.urlsafe_b64encode(bytes(packed)).decode().rstrip("=")
+
+
+def ai_auctions_url(df: pl.DataFrame, source: str, seat: Optional[str] = None) -> str:
+    """Address of the auction model explorer opened on the boards of df.
+
+    source names this app to the explorer: acbl, ffbridge, bridgewebs, pbn or
+    brill. seat (N, E, S or W) is the seat the explorer looks from first. Only
+    the deals go into the address: no names and no results.
+    """
+    from urllib.parse import urlencode
+
+    deals = (
+        df.select("Board", "PBN", "Dealer", "Vul")
+        .drop_nulls()
+        .unique()
+        .sort("Board", "PBN")
+    )
+    if deals.height == 0:
+        raise ValueError("this game has no deals")
+    if deals.height > AI_AUCTIONS_MAX_BOARDS:
+        raise ValueError(f"{deals.height} boards are more than a link holds ({AI_AUCTIONS_MAX_BOARDS})")
+    asked = {"from": source, "boards": pack_boards(list(deals.iter_rows()))}
+    if seat in tuple(_PACK_SEATS):
+        asked["seat"] = seat
+    return f"{AI_AUCTIONS_URL}/?{urlencode(asked)}"
+
+
+def sidebar_ai_auctions_link(source: str) -> None:
+    """Sidebar link 'AI Auctions': the session's boards in the auction model explorer, in a new tab.
+
+    The explorer has robots bid each board and shows, call by call, what the
+    auction model believes from one seat. A game whose boards cannot be put
+    into a link shows the link switched off, with the reason in its help.
+    """
+    label = chrome_text("ai_auctions", "AI Auctions")
+    # the apps keep the player's seat as a letter or as a word (ACBL: 'North')
+    seat = str(st.session_state.get("player_direction") or "")[:1].upper()
+    try:
+        url = ai_auctions_url(st.session_state.df, source, seat)
+    except (ValueError, pl.exceptions.PolarsError) as error:
+        st.sidebar.link_button(label, AI_AUCTIONS_URL, disabled=True, help=f"Not available for this game: {error}")
+        return
+    st.sidebar.link_button(
+        label,
+        url,
+        help=chrome_text(
+            "ai_auctions_help",
+            "Open this game's boards in the auction explorer: robots bid each board, and the page shows what "
+            "the AI believes after every call. Opens in a new tab.",
+        ),
+    )
+
+
 def standard_report_title() -> str:
     """Report heading. Organizer-only sessions are marked provisional."""
     title = chrome_text("report_title", "Bridge Game Postmortem Report")

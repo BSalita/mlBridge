@@ -592,17 +592,16 @@ def add_quick_tricks(df: pl.DataFrame) -> pl.DataFrame:
     - `QT_(NS|EW)_[SHDC]`: Partnership quick tricks by suit
 
     Notes:
-    - Standard QT values: AK=2.0, AQ=1.5, A=1.0, KQ=1.0, K=0.5
+    - Standard QT values: AK=2.0, AQ=1.5, A=1.0, KQ=1.0, Kx=0.5; a singleton K is 0
     """
-    qt_dict = {'AK': 2.0, 'AQ': 1.5, 'A': 1.0, 'KQ': 1.0, 'K': 0.5}
-    
     # Calculate QT for each suit
     qt_expr = [
         pl.when(pl.col(f'Suit_{d}_{s}').str.starts_with('AK')).then(pl.lit(2.0, dtype=pl.Float32))
         .when(pl.col(f'Suit_{d}_{s}').str.starts_with('AQ')).then(pl.lit(1.5, dtype=pl.Float32))
         .when(pl.col(f'Suit_{d}_{s}').str.starts_with('A')).then(pl.lit(1.0, dtype=pl.Float32))
         .when(pl.col(f'Suit_{d}_{s}').str.starts_with('KQ')).then(pl.lit(1.0, dtype=pl.Float32))
-        .when(pl.col(f'Suit_{d}_{s}').str.starts_with('K')).then(pl.lit(0.5, dtype=pl.Float32))
+        .when(pl.col(f'Suit_{d}_{s}').str.starts_with('K') & (pl.col(f'Suit_{d}_{s}').str.len_chars() >= 2))
+        .then(pl.lit(0.5, dtype=pl.Float32))
         .otherwise(pl.lit(0.0, dtype=pl.Float32)).alias(f'QT_{d}_{s}')
         for d in 'NESW' for s in 'SHDC'
     ]
@@ -645,9 +644,9 @@ def add_quick_losers(df: pl.DataFrame) -> pl.DataFrame:
     """Calculate Quick Losers for bridge hands using vectorized pattern matching.
     
     Purpose:
-    - Compute quick losers based on missing honor combinations
+    - Count the tricks the defenders can take quickly in each suit, i.e. missing
+      first- and second-round control (different from the Losing Trick Count)
     - Generate QL totals by direction, suit, and partnership
-    - Provide offensive strength assessment for hand evaluation (Losing Trick Count concept)
 
     Parameters:
     - df: DataFrame with suit string columns
@@ -661,66 +660,54 @@ def add_quick_losers(df: pl.DataFrame) -> pl.DataFrame:
     Output columns:
     - `QL_[NESW]_[SHDC]`: Quick losers by direction and suit
     - `QL_[NESW]`: Total quick losers by direction
-    - `QL_(NS|EW)`: Partnership quick losers totals
     - `QL_(NS|EW)_[SHDC]`: Partnership quick losers by suit
+    - `QL_(NS|EW)`: Partnership quick losers totals
 
     Notes:
-    - Standard QL values: Void=0, Singleton(A)=0, Singleton(x)=1
-    - Doubleton: AK=0, Ax/Kx=1, xx=2
-    - 3+ cards: 3 minus count of A, K, Q present (0-3 losers)
+    - One hand, per suit: void or ace = 0; king (any length) or singleton = 1; otherwise 2
+    - Partnership, per suit: the smaller of the two hands' values (partner's control
+      covers the suit); the partnership total adds the four suits, so QL_NS is not QL_N + QL_S
+    - Tested 2026-11-22 against double-dummy tricks on 1M ACBL tournament deals
+      (src/hand-eval/RESULTS.md): added to HCP + fit length it predicts suit-contract
+      tricks better than LTC or quick tricks do
     """
-    
+
     # Calculate QL for each suit
     ql_expr = [
-        pl.when(pl.col(f'Suit_{d}_{s}').str.len_chars() == 0).then(pl.lit(0, dtype=pl.UInt8))
-        .when(pl.col(f'Suit_{d}_{s}').str.len_chars() == 1).then(
-            pl.when(pl.col(f'Suit_{d}_{s}').str.starts_with('A')).then(pl.lit(0, dtype=pl.UInt8))
-            .otherwise(pl.lit(1, dtype=pl.UInt8)))
-        .when(pl.col(f'Suit_{d}_{s}').str.len_chars() == 2).then(
-            pl.when(pl.col(f'Suit_{d}_{s}').str.starts_with('AK')).then(pl.lit(0, dtype=pl.UInt8))
-            .when(pl.col(f'Suit_{d}_{s}').str.starts_with('A')).then(pl.lit(1, dtype=pl.UInt8))
-            .when(pl.col(f'Suit_{d}_{s}').str.starts_with('K')).then(pl.lit(1, dtype=pl.UInt8))
-            .otherwise(pl.lit(2, dtype=pl.UInt8)))
-        .otherwise(pl.lit(3, dtype=pl.UInt8)
-            - pl.col(f'Suit_{d}_{s}').str.contains('A').cast(pl.UInt8)
-            - pl.col(f'Suit_{d}_{s}').str.contains('K').cast(pl.UInt8)
-            - pl.col(f'Suit_{d}_{s}').str.contains('Q').cast(pl.UInt8))
+        pl.when((pl.col(f'Suit_{d}_{s}').str.len_chars() == 0) | pl.col(f'Suit_{d}_{s}').str.contains('A'))
+        .then(pl.lit(0, dtype=pl.UInt8))
+        .when((pl.col(f'Suit_{d}_{s}').str.len_chars() == 1) | pl.col(f'Suit_{d}_{s}').str.contains('K'))
+        .then(pl.lit(1, dtype=pl.UInt8))
+        .otherwise(pl.lit(2, dtype=pl.UInt8))
         .alias(f'QL_{d}_{s}')
         for d in 'NESW' for s in 'SHDC'
     ]
-    
+
     # Apply suit QL calculations
     df = df.with_columns(ql_expr)
-    
+
     # Calculate QL for each direction
     direction_ql = [
-        pl.sum_horizontal([pl.col(f'QL_{d}_{s}') for s in 'SHDC']).alias(f'QL_{d}')
+        pl.sum_horizontal([pl.col(f'QL_{d}_{s}') for s in 'SHDC']).cast(pl.UInt8).alias(f'QL_{d}')
         for d in 'NESW'
     ]
-    
+
     # Apply direction QL calculations
     df = df.with_columns(direction_ql)
-    
-    # Calculate partnership QL
-    partnership_ql = [
-        (pl.col('QL_N') + pl.col('QL_S')).alias('QL_NS'),
-        (pl.col('QL_E') + pl.col('QL_W')).alias('QL_EW')
-    ]
-    
-    # Apply partnership QL calculations
-    df = df.with_columns(partnership_ql)
-    
-    # Calculate partnership QL by suit
+
+    # Partnership QL by suit: the better-controlled hand decides
     partnership_ql_suit = [
-        (pl.col(f'QL_N_{s}') + pl.col(f'QL_S_{s}')).alias(f'QL_NS_{s}')
-        for s in 'SHDC'
-    ] + [
-        (pl.col(f'QL_E_{s}') + pl.col(f'QL_W_{s}')).alias(f'QL_EW_{s}')
-        for s in 'SHDC'
+        pl.min_horizontal(pl.col(f'QL_{p[0]}_{s}'), pl.col(f'QL_{p[1]}_{s}')).alias(f'QL_{p}_{s}')
+        for p in ('NS', 'EW') for s in 'SHDC'
     ]
-    
-    # Apply partnership QL by suit calculations
-    return df.with_columns(partnership_ql_suit)
+    df = df.with_columns(partnership_ql_suit)
+
+    # Partnership QL totals
+    partnership_ql = [
+        pl.sum_horizontal([pl.col(f'QL_{p}_{s}') for s in 'SHDC']).cast(pl.UInt8).alias(f'QL_{p}')
+        for p in ('NS', 'EW')
+    ]
+    return df.with_columns(partnership_ql)
 
 
 def add_losing_trick_count(df: pl.DataFrame) -> pl.DataFrame:
@@ -750,7 +737,7 @@ def add_losing_trick_count(df: pl.DataFrame) -> pl.DataFrame:
     - Standard LTC values: Void=0, Singleton(A)=0, Singleton(x)=1
     - Doubleton: AK=0, Ax/Kx=1, xx=2
     - 3+ cards: 3 minus count of A, K, Q present (0-3 losers per suit)
-    - Combined tricks estimate: 24 - LTC_NS - LTC_EW
+    - Partnership tricks estimate with an 8+ card fit: 24 - LTC_N - LTC_S (= 24 - LTC_NS)
     """
     
     # Calculate LTC for each suit
@@ -958,15 +945,16 @@ def add_law_of_total_tricks(df: pl.DataFrame) -> pl.DataFrame:
     - `SL_(NS|EW)_[SHDC]`: Partnership suit lengths
 
     Output columns:
-    - `LoTT_NS`: Total suit length for North-South partnership
-    - `LoTT_EW`: Total suit length for East-West partnership
+    - `LoTT_NS`: North-South's trumps: the length of their longest combined suit
+    - `LoTT_EW`: East-West's trumps: the length of their longest combined suit
 
     Notes:
-    - LoTT suggests total tricks ≈ combined trump length of both partnerships
+    - The Law: total tricks (each side's tricks in its own best fit) ~= LoTT_NS + LoTT_EW
+    - Until 2026-11-22 these columns added all four suit lengths and were always 26
     """
     df = df.with_columns([
-        (pl.col('SL_NS_C') + pl.col('SL_NS_D') + pl.col('SL_NS_H') + pl.col('SL_NS_S')).alias('LoTT_NS'),
-        (pl.col('SL_EW_C') + pl.col('SL_EW_D') + pl.col('SL_EW_H') + pl.col('SL_EW_S')).alias('LoTT_EW'),
+        pl.max_horizontal([pl.col(f'SL_{p}_{s}') for s in 'CDHS']).cast(pl.UInt8).alias(f'LoTT_{p}')
+        for p in ('NS', 'EW')
     ])
     return df
 
@@ -7198,7 +7186,11 @@ class HandAugmenter:
             for suit in "SHDC":
                 assert f'Suit_{direction}_{suit}' in self.df.columns, f"Required column 'Suit_{direction}_{suit}' not found in DataFrame"
         
-        if 'QT_N_C' not in self.df.columns:
+        # Columns written before 2026-11-22 gave a singleton king 0.5: recompute them
+        stale = 'QT_N_C' in self.df.columns and bool(self.df.select(pl.any_horizontal([
+            (pl.col(f'Suit_{d}_{s}') == 'K') & (pl.col(f'QT_{d}_{s}') > 0)
+            for d in 'NESW' for s in 'SHDC']).any()).item())
+        if 'QT_N_C' not in self.df.columns or stale:
             self.df = self._time_operation("create QT", add_quick_tricks, self.df)
         
         # Assert columns were created
@@ -7212,7 +7204,13 @@ class HandAugmenter:
             for suit in "SHDC":
                 assert f'Suit_{direction}_{suit}' in self.df.columns, f"Required column 'Suit_{direction}_{suit}' not found in DataFrame"
         
-        if 'QL_N_S' not in self.df.columns:
+        # Columns written before 2026-11-22 were a copy of LTC (hand values up to 3,
+        # QL_NS = QL_N + QL_S): recompute them
+        stale = 'QL_N_S' in self.df.columns and bool(self.df.select(pl.any_horizontal(
+            [pl.col(f'QL_{d}_{s}') > 2 for d in 'NESW' for s in 'SHDC']
+            + [pl.col('QL_NS') != pl.sum_horizontal([pl.min_horizontal(f'QL_N_{s}', f'QL_S_{s}') for s in 'SHDC'])]
+        ).any()).item())
+        if 'QL_N_S' not in self.df.columns or stale:
             self.df = self._time_operation("create QL", add_quick_losers, self.df)
         
         # Assert columns were created
@@ -8103,7 +8101,9 @@ class FinalContractAugmenter:
         required_columns = [f'SL_{pair}_{suit}' for pair in ['NS', 'EW'] for suit in 'SHDC']
         has_required_columns = all(col in self.df.columns for col in required_columns)
         
-        if has_required_columns and 'LoTT_NS' not in self.df.columns:
+        # Columns written before 2026-11-22 were always 26 (all four suits added): recompute them
+        stale = 'LoTT_NS' in self.df.columns and self.df.height > 0 and int(self.df['LoTT_NS'].max()) > 13
+        if has_required_columns and ('LoTT_NS' not in self.df.columns or stale):
             self.df = self._time_operation("create LoTT", add_law_of_total_tricks, self.df)
             
             # Assert columns were created

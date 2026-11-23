@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import contextlib
+import logging
+import os
+import threading
 from typing import Any, Dict, Optional
 
 import polars as pl
@@ -12,22 +16,75 @@ from mlBridge.mlBridgeAcblLib import (
 )
 from mlBridge.mlBridgeAugmentLib import AllAugmentations
 
+logger = logging.getLogger(__name__)
+
+# The ACBL pipeline (acbl_hand_records_augment.py, ACBL_SUITC=1) adds the SC_*
+# SuitC single-suit columns to every deal, and step 5a lists them as model
+# inputs, so live postmortems add them too. The cache is the shared one
+# (SUITC_CACHE_DIR; /data/suitc/combos in the postmortem container); SuitC
+# runs only for holdings it lacks. ACBL_POSTMORTEM_SUITC=0 turns this off.
+_suitc_cache: Any = None
+_suitc_checked = False
+_suitc_init_lock = threading.Lock()
+# SuitCCache is not thread-safe: augmentations that use it run one at a time.
+_suitc_augment_lock = threading.Lock()
+
+
+def postmortem_suitc_cache() -> Any:
+    """The process's shared mlBridgeSuitCLib.SuitCCache, or None when SuitC is off.
+
+    Off when ACBL_POSTMORTEM_SUITC is 0/false/off, or when the SuitC program is
+    missing (holdings absent from the cache would be stored as errors).
+    """
+    global _suitc_cache, _suitc_checked
+    with _suitc_init_lock:
+        if not _suitc_checked:
+            _suitc_checked = True
+            if os.environ.get("ACBL_POSTMORTEM_SUITC", "1").strip().lower() in ("0", "false", "off", "no"):
+                logger.info("SuitC columns off (ACBL_POSTMORTEM_SUITC)")
+            else:
+                from mlBridge import mlBridgeSuitCLib
+                try:
+                    exe = mlBridgeSuitCLib.suitc_exe()
+                except FileNotFoundError as exc:
+                    logger.warning(f"SuitC columns off: {exc}")
+                else:
+                    _suitc_cache = mlBridgeSuitCLib.SuitCCache()
+                    if not _suitc_cache.directory.is_dir():
+                        logger.warning(
+                            f"SuitC cache directory not found: {_suitc_cache.directory}; "
+                            "every holding runs SuitC until it fills")
+                    logger.info(f"SuitC columns on: {exe}, cache {_suitc_cache.directory}")
+        return _suitc_cache
+
 
 def augment_postmortem_dataframe(
     df: pl.DataFrame,
     *,
     single_dummy_sample_count: int = 40,
+    suitc: Any = "auto",
+    output_progress: bool = False,
+    progress: Any = None,
+    lock_func: Any = None,
 ) -> pl.DataFrame:
-    """Apply the full postmortem augmentation pipeline without Streamlit."""
+    """Apply the full postmortem augmentation pipeline without Streamlit.
+
+    suitc: a mlBridgeSuitCLib.SuitCCache, None for no SC_* columns, or "auto"
+    for postmortem_suitc_cache().
+    """
+    if isinstance(suitc, str) and suitc == "auto":
+        suitc = postmortem_suitc_cache()
     augmenter = AllAugmentations(
         df,
         None,
         sd_productions=single_dummy_sample_count,
-        output_progress=False,
-        progress=None,
-        lock_func=None,
+        output_progress=output_progress,
+        progress=progress,
+        lock_func=lock_func,
+        suitc=suitc,
     )
-    augmented, _ = augmenter.perform_all_augmentations()
+    with (_suitc_augment_lock if suitc is not None else contextlib.nullcontext()):
+        augmented, _ = augmenter.perform_all_augmentations()
     return augmented.with_columns(pl.col(pl.Float64).cast(pl.Float32))
 
 

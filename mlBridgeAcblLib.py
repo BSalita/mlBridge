@@ -48,6 +48,19 @@ from mlBridge.mlBridge import (
 )
 
 
+def normalize_brs_expr(col: str = 'board_record_string') -> pl.Expr:
+    """ACBL's board_record_string in the older form: no spaces, ten written as 10.
+
+    Club hand records from about May 2026 on put a space between cards and write
+    the ten as T ("S Q 6 3H Q J 4 2D K 5C ..."); brs_to_pbn then fails with
+    "deal contains more than four hands". Older strings ("SJ106HAQ8764...") are
+    unchanged. T only ever means the ten here: suits are S, H, D, C.
+    """
+    return (pl.col(col).cast(pl.Utf8)
+            .str.replace_all(r'\s+', '')
+            .str.replace_all('T', '10', literal=True))
+
+
 def get_club_results(cns, base_url, acbl_url, acblPath, read_local):
     htmls = {}
     total_clubs = len(cns)
@@ -1043,7 +1056,7 @@ def merge_clean_augment_club_dfs(dfs, sd_cache_d, acbl_number):  # todo: acbl_nu
 
     df = df.with_columns([
         pl.col('Club').cast(pl.Int32), # todo: convert to Categorical but must align with acbl_club_model_data or convert in predict?
-        pl.col('board_record_string').cast(pl.Utf8),
+        normalize_brs_expr('board_record_string'),
         pl.col('Date').str.strptime(pl.Date, format="%Y-%m-%d %H:%M:%S"), # game_date has both date and time, but tournament start_date has only date.
         #pl.col('Final_Standing_NS').cast(pl.Float32), # Final_Standing_NS is not a column in the data. use percentage instead?
         #pl.col('Final_Standing_EW').cast(pl.Float32), # Final_Standing_EW is not a column in the data. use percentage instead?

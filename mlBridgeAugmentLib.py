@@ -4722,31 +4722,46 @@ def _elo_player_kernel(
     n_ns, n_ew, null_ns, null_ew, max_len,
     initial_rating, k_base, provisional_boost_until, elo_scale, score_amplifier,
     min_rating, max_rating, gsd_ns, gsd_ew, anchors,
+    boost, merged, start_ns, start_ew,
     r_n_before, r_s_before, r_e_before, r_w_before, e_ns_out, e_ew_out,
     r_n_after, r_s_after, r_e_after, r_w_after,
     n_n_out, n_s_out, n_e_out, n_w_out,
     sd_ns_out, sd_ew_out, mean_ns_out, mean_ew_out,
 ):
-    ratings_ns = np.full(n_ns, initial_rating, dtype=np.float32)
-    ratings_ew = np.full(n_ew, initial_rating, dtype=np.float32)
+    # ``merged``: one rating per player in both directions. The N/S and E/W
+    # index maps are then one map, and the E/W state arrays are the N/S ones
+    # (a player committed once per session, whichever direction marked them
+    # first; Howell players who switch direction share one delta).
+    # ``start_ns`` / ``start_ew``: each slot's starting rating.
+    ratings_ns = start_ns.copy()
     bp_ns = np.zeros(n_ns, dtype=np.int32)
-    bp_ew = np.zeros(n_ew, dtype=np.int32)
     ns_sessions = np.zeros(n_ns, dtype=np.int32)
-    ew_sessions = np.zeros(n_ew, dtype=np.int32)
     delta_ns = np.zeros(n_ns, dtype=np.float64)
-    delta_ew = np.zeros(n_ew, dtype=np.float64)
     bc_ns = np.zeros(n_ns, dtype=np.int32)
-    bc_ew = np.zeros(n_ew, dtype=np.int32)
     mark_ns = np.full(n_ns, -1, dtype=np.int64)
-    mark_ew = np.full(n_ew, -1, dtype=np.int64)
+    seen_ns = {np.int64(-1)}
+    if merged:
+        ratings_ew = ratings_ns
+        bp_ew = bp_ns
+        ew_sessions = ns_sessions
+        delta_ew = delta_ns
+        bc_ew = bc_ns
+        mark_ew = mark_ns
+        seen_ew = seen_ns
+    else:
+        ratings_ew = start_ew.copy()
+        bp_ew = np.zeros(n_ew, dtype=np.int32)
+        ew_sessions = np.zeros(n_ew, dtype=np.int32)
+        delta_ew = np.zeros(n_ew, dtype=np.float64)
+        bc_ew = np.zeros(n_ew, dtype=np.int32)
+        mark_ew = np.full(n_ew, -1, dtype=np.int64)
+        seen_ew = {np.int64(-1)}
     part_ns = np.zeros(n_ns, dtype=np.int64)
     part_ew = np.zeros(n_ew, dtype=np.int64)
     buf_ns = np.zeros(max_len, dtype=np.float32)
     buf_ew = np.zeros(max_len, dtype=np.float32)
     tmp = np.zeros(max_len, dtype=np.float32)
     two = np.float32(2.0)
-    seen_ns = {np.int64(-1)}
-    seen_ew = {np.int64(-1)}
 
     for s in range(sess_starts.shape[0]):
         s_start = sess_starts[s]
@@ -4792,10 +4807,10 @@ def _elo_player_kernel(
                 e_ew = 1.0 / (1.0 + 10.0 ** (-(ew_self - field_avg_ew) / elo_scale))
                 sc = np.float64(scale[i])
                 em = np.float64(emp[i])
-                k_n = k_base * (1.5 if bp_ns[pn] < provisional_boost_until else 1.0) * sc * st_ns * fs_ns * em
-                k_s = k_base * (1.5 if bp_ns[ps] < provisional_boost_until else 1.0) * sc * st_ns * fs_ns * em
-                k_e = k_base * (1.5 if bp_ew[pe] < provisional_boost_until else 1.0) * sc * st_ew * fs_ew * em
-                k_w = k_base * (1.5 if bp_ew[pw] < provisional_boost_until else 1.0) * sc * st_ew * fs_ew * em
+                k_n = k_base * (boost if bp_ns[pn] < provisional_boost_until else 1.0) * sc * st_ns * fs_ns * em
+                k_s = k_base * (boost if bp_ns[ps] < provisional_boost_until else 1.0) * sc * st_ns * fs_ns * em
+                k_e = k_base * (boost if bp_ew[pe] < provisional_boost_until else 1.0) * sc * st_ew * fs_ew * em
+                k_w = k_base * (boost if bp_ew[pw] < provisional_boost_until else 1.0) * sc * st_ew * fs_ew * em
 
                 r_n_before[i] = ratings_ns[pn]
                 r_s_before[i] = ratings_ns[ps]
@@ -5291,6 +5306,9 @@ def compute_player_matchpoint_elo_ratings(
     max_rating: float = 3000.0,        # hard ceiling for the running rating
     global_stdev_ns: float | None = None,  # K-dampening normalizer; auto-derived if None
     global_stdev_ew: float | None = None,
+    boost: float = 1.5,                # K multiplier for the first provisional_boost_until boards
+    merged: bool = False,              # one rating per player for both directions
+    start_rating_cols: tuple[str, str, str, str] | None = None,  # per-seat starting ratings
 ) -> pl.DataFrame:
     """Compute field-relative Elo-style player ratings for duplicate boards.
 
@@ -5350,6 +5368,9 @@ def compute_player_matchpoint_elo_ratings(
         max_rating=max_rating,
         global_stdev_ns=global_stdev_ns,
         global_stdev_ew=global_stdev_ew,
+        boost=boost,
+        merged=merged,
+        start_rating_cols=start_rating_cols,
     )
     return _elo_attach(df_sorted, out_df, replace_existing)
 
@@ -5368,8 +5389,19 @@ def _player_elo_frame(
     max_rating: float = 3000.0,
     global_stdev_ns: float | None = None,
     global_stdev_ew: float | None = None,
+    boost: float = 1.5,
+    merged: bool = False,
+    start_rating_cols: tuple[str, str, str, str] | None = None,
 ) -> pl.DataFrame:
-    """Output columns of compute_player_matchpoint_elo_ratings (not attached)."""
+    """Output columns of compute_player_matchpoint_elo_ratings (not attached).
+
+    ``boost``: K multiplier while a player has fewer than
+    ``provisional_boost_until`` boards. ``merged``: one rating per player for
+    both directions instead of separate N/S and E/W ratings.
+    ``start_rating_cols``: per-seat columns (N, S, E, W) holding the rating a
+    player starts from; each player takes the first non-null value in
+    processing order, and players with none start at ``initial_rating``.
+    """
     need_cols = {
         "Player_ID_N",
         "Player_ID_S",
@@ -5386,13 +5418,20 @@ def _player_elo_frame(
     pct_ns, skip_nan = _elo_pct_array(df_sorted)
     scale = _elo_section_scale(df_sorted, n_rows, max_section_pairs)
 
-    # Dense player indexes per direction (N+S share one map, E+W another).
-    (idx_n_arr, idx_s_arr), n_ns_slots, null_ns = _elo_dense_ids(
-        [df_sorted["Player_ID_N"], df_sorted["Player_ID_S"]]
-    )
-    (idx_e_arr, idx_w_arr), n_ew_slots, null_ew = _elo_dense_ids(
-        [df_sorted["Player_ID_E"], df_sorted["Player_ID_W"]]
-    )
+    if merged:
+        # One map for all four seats: a player's rating follows them across directions.
+        (idx_n_arr, idx_s_arr, idx_e_arr, idx_w_arr), n_ns_slots, null_ns = _elo_dense_ids(
+            [df_sorted["Player_ID_N"], df_sorted["Player_ID_S"], df_sorted["Player_ID_E"], df_sorted["Player_ID_W"]]
+        )
+        n_ew_slots, null_ew = n_ns_slots, null_ns
+    else:
+        # Dense player indexes per direction (N+S share one map, E+W another).
+        (idx_n_arr, idx_s_arr), n_ns_slots, null_ns = _elo_dense_ids(
+            [df_sorted["Player_ID_N"], df_sorted["Player_ID_S"]]
+        )
+        (idx_e_arr, idx_w_arr), n_ew_slots, null_ew = _elo_dense_ids(
+            [df_sorted["Player_ID_E"], df_sorted["Player_ID_W"]]
+        )
 
     # Outputs (indexed by ORIGINAL row position)
     R_N_Before = np.empty(n_rows, dtype=np.float32)
@@ -5438,6 +5477,32 @@ def _player_elo_frame(
     proc_order, sess_starts, sess_ends, sess_codes, use_seen, n_codes, board_f = _elo_session_layout(df_sorted)
     max_len = int((sess_ends - sess_starts).max()) if sess_starts.size else 0
 
+    start_ns = np.full(n_ns_slots, initial_rating, dtype=np.float32)
+    start_ew = start_ns if merged else np.full(n_ew_slots, initial_rating, dtype=np.float32)
+    if start_rating_cols is not None:
+        # Each slot starts from its first non-null start value in processing order.
+        rank = np.empty(n_rows, dtype=np.int64)
+        rank[proc_order] = np.arange(n_rows, dtype=np.int64)
+        idx_by_seat = {"N": idx_n_arr, "S": idx_s_arr, "E": idx_e_arr, "W": idx_w_arr}
+        groups = [("NSEW", start_ns)] if merged else [("NS", start_ns), ("EW", start_ew)]
+        for seats, target in groups:
+            idx_parts, val_parts, rank_parts = [], [], []
+            for seat in seats:
+                vals = df_sorted[start_rating_cols["NSEW".index(seat)]].cast(pl.Float64).to_numpy()
+                ok = np.isfinite(vals)
+                idx_parts.append(idx_by_seat[seat][ok])
+                val_parts.append(vals[ok])
+                rank_parts.append(rank[ok])
+            idx_all = np.concatenate(idx_parts)
+            if idx_all.size == 0:
+                continue
+            order = np.argsort(np.concatenate(rank_parts), kind="stable")
+            uniq, first = np.unique(idx_all[order], return_index=True)
+            target[uniq] = np.concatenate(val_parts)[order][first].astype(np.float32)
+        for target, null_slot in ((start_ns, null_ns), (start_ew, null_ew)):
+            if null_slot >= 0:
+                target[null_slot] = initial_rating
+
     # Per-session loop, compiled with numba (see _elo_player_kernel).
     _elo_ensure_jit()
     _elo_player_kernel(
@@ -5447,6 +5512,7 @@ def _player_elo_frame(
         float(initial_rating), float(k_base), int(provisional_boost_until), float(elo_scale),
         float(score_amplifier), float(min_rating), float(max_rating),
         float(global_stdev_ns), float(global_stdev_ew), _elo_anchors(),
+        float(boost), bool(merged), start_ns, start_ew,
         R_N_Before, R_S_Before, R_E_Before, R_W_Before, E_NS, E_EW,
         R_N_after, R_S_after, R_E_after, R_W_after,
         N_N, N_S, N_E, N_W,
